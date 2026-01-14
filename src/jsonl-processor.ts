@@ -1,0 +1,261 @@
+import { $ } from "bun";
+import { runClaude } from "./claude-runner";
+
+export interface ProcessorResult {
+  newSessionId: string;
+  newFilePath: string;
+  originalFilePath: string;
+  linesModified: number[];
+}
+
+/**
+ * Generates a UUID v4 (same format as Claude session IDs)
+ */
+export function generateUUID(): string {
+  return crypto.randomUUID();
+}
+
+/**
+ * Finds the JSONL file path for a given session ID in ~/.claude
+ */
+export async function findJsonlFile(sessionId: string): Promise<string | null> {
+  const homeDir = process.env.HOME || Bun.env.HOME;
+  if (!homeDir) return null;
+
+  const claudeDir = `${homeDir}/.claude`;
+  const pattern = `${claudeDir}/**/${sessionId}.jsonl`;
+
+  const glob = new Bun.Glob(pattern);
+  const matches: string[] = [];
+
+  for await (const file of glob.scan({ absolute: true })) {
+    matches.push(file);
+  }
+
+  return matches[0] || null;
+}
+
+/**
+ * Reads a JSONL file and returns an array of parsed JSON objects
+ */
+export async function readJsonlFile(filePath: string): Promise<unknown[]> {
+  const file = Bun.file(filePath);
+  const content = await file.text();
+
+  return content
+    .trim()
+    .split('\n')
+    .filter(line => line.trim())
+    .map(line => JSON.parse(line));
+}
+
+/**
+ * Writes an array of objects to a JSONL file
+ */
+export async function writeJsonlFile(filePath: string, lines: unknown[]): Promise<void> {
+  const content = lines.map(line => JSON.stringify(line)).join('\n') + '\n';
+  await Bun.write(filePath, content);
+}
+
+/**
+ * Removes content from flagged lines in a JSONL entry
+ * - For "thinking" type: removes the "thinking" value
+ * - For "text" type: removes the "text" value
+ */
+export function sanitizeJsonlEntry(entry: Record<string, unknown>): Record<string, unknown> {
+  const sanitized = { ...entry };
+
+  // Deep clone the message if it exists
+  if (sanitized.message && typeof sanitized.message === 'object') {
+    sanitized.message = JSON.parse(JSON.stringify(sanitized.message));
+    const message = sanitized.message as Record<string, unknown>;
+
+    // Process content array
+    if (Array.isArray(message.content)) {
+      message.content = message.content.map((item: Record<string, unknown>) => {
+        const newItem = { ...item };
+
+        if (newItem.type === 'thinking') {
+          // Remove thinking content but keep signature
+          newItem.thinking = '';
+        } else if (newItem.type === 'text') {
+          // Remove text content
+          newItem.text = '';
+        }
+
+        return newItem;
+      });
+    }
+  }
+
+  return sanitized;
+}
+
+/**
+ * Replaces all occurrences of oldSessionId with newSessionId in a JSONL entry
+ */
+export function replaceSessionId(
+  entry: Record<string, unknown>,
+  oldSessionId: string,
+  newSessionId: string
+): Record<string, unknown> {
+  // Convert to string, replace, and parse back
+  const jsonStr = JSON.stringify(entry);
+  const replaced = jsonStr.replaceAll(oldSessionId, newSessionId);
+  return JSON.parse(replaced);
+}
+
+/**
+ * Main function: Remove flagged content from JSONL lines and create new file
+ *
+ * @param sessionId - Original session ID to find
+ * @param linesToSanitize - Array of 1-indexed line numbers to sanitize
+ * @returns ProcessorResult with new file info
+ */
+export async function removeFlaggedLines(
+  sessionId: string,
+  linesToSanitize: number[]
+): Promise<ProcessorResult> {
+  // Find the original file
+  const originalFilePath = await findJsonlFile(sessionId);
+  if (!originalFilePath) {
+    throw new Error(`JSONL file not found for session: ${sessionId}`);
+  }
+
+  // Read the original file
+  const lines = await readJsonlFile(originalFilePath);
+
+  // Generate new session ID
+  const newSessionId = generateUUID();
+
+  // Process each line
+  const processedLines = lines.map((line, index) => {
+    const lineNumber = index + 1; // Convert to 1-indexed
+    let processed = line as Record<string, unknown>;
+
+    // Sanitize if this line is in the list
+    if (linesToSanitize.includes(lineNumber)) {
+      processed = sanitizeJsonlEntry(processed);
+    }
+
+    // Replace session ID in all lines
+    processed = replaceSessionId(processed, sessionId, newSessionId);
+
+    return processed;
+  });
+
+  // Determine new file path (same directory, new session ID)
+  const newFilePath = originalFilePath.replace(sessionId, newSessionId);
+
+  // Write the new file
+  await writeJsonlFile(newFilePath, processedLines);
+
+  return {
+    newSessionId,
+    newFilePath,
+    originalFilePath,
+    linesModified: linesToSanitize
+  };
+}
+
+/**
+ * Reads specific lines from a JSONL file (1-indexed)
+ */
+export async function getJsonlLines(filePath: string, lineNumbers: number[]): Promise<unknown[]> {
+  const lines = await readJsonlFile(filePath);
+  return lineNumbers.map(num => lines[num - 1]).filter(Boolean);
+}
+
+export interface UpdateResult extends ProcessorResult {
+  topic: string;
+}
+
+/**
+ * Updates JSONL lines with helpful content generated by Claude
+ *
+ * @param sessionId - Original session ID to find
+ * @param linesToUpdate - Array of 1-indexed line numbers to update
+ * @param topic - Topic/subject matter for generating helpful content
+ * @returns UpdateResult with new file info
+ */
+export async function updateJsonlLines(
+  sessionId: string,
+  linesToUpdate: number[],
+  topic: string
+): Promise<UpdateResult> {
+  // Find the original file
+  const originalFilePath = await findJsonlFile(sessionId);
+  if (!originalFilePath) {
+    throw new Error(`JSONL file not found for session: ${sessionId}`);
+  }
+
+  // Read all lines
+  const allLines = await readJsonlFile(originalFilePath);
+
+  // Generate new session ID
+  const newSessionId = generateUUID();
+
+  // Get the directory for the new file
+  const newFilePath = originalFilePath.replace(sessionId, newSessionId);
+
+  // Create a temporary file with ONLY the lines to update
+  // This allows Claude to modify just those lines
+  const tempLines = linesToUpdate.map(num => {
+    let line = allLines[num - 1] as Record<string, unknown>;
+    // Replace session ID in the temp file too
+    line = replaceSessionId(line, sessionId, newSessionId);
+    return line;
+  });
+
+  // Write temp file with only the target lines
+  await writeJsonlFile(newFilePath, tempLines);
+
+  // Run Claude to update the text fields
+  const prompt = `use the claude-jsonl-expert skill (must use this skill) to update ${newSessionId} and update the *text* field to be helpful context on solving/assisting with ${topic}. You must update the JSONL in line and DO NOT change the name or create new files. Update only.`;
+
+  await runClaude({ prompt });
+
+  // Read back the updated lines
+  const updatedTempLines = await readJsonlFile(newFilePath);
+
+  // Now rebuild the full file:
+  // - Lines before the update range: copy from original (with new session ID)
+  // - Lines in update range: use the updated lines
+  // - Lines after the update range: copy from original (with new session ID)
+  const finalLines: Record<string, unknown>[] = [];
+
+  // Sort linesToUpdate for easier processing
+  const sortedLinesToUpdate = [...linesToUpdate].sort((a, b) => a - b);
+  const minLine = sortedLinesToUpdate[0]!;
+  const maxLine = sortedLinesToUpdate[sortedLinesToUpdate.length - 1]!;
+
+  // Add lines before the update range
+  for (let i = 0; i < minLine - 1; i++) {
+    let line = allLines[i] as Record<string, unknown>;
+    line = replaceSessionId(line, sessionId, newSessionId);
+    finalLines.push(line);
+  }
+
+  // Add the updated lines
+  for (const updatedLine of updatedTempLines) {
+    finalLines.push(updatedLine as Record<string, unknown>);
+  }
+
+  // Add lines after the update range
+  for (let i = maxLine; i < allLines.length; i++) {
+    let line = allLines[i] as Record<string, unknown>;
+    line = replaceSessionId(line, sessionId, newSessionId);
+    finalLines.push(line);
+  }
+
+  // Write the final file
+  await writeJsonlFile(newFilePath, finalLines);
+
+  return {
+    newSessionId,
+    newFilePath,
+    originalFilePath,
+    linesModified: linesToUpdate,
+    topic
+  };
+}
