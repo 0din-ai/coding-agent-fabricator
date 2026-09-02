@@ -1,12 +1,13 @@
 # Fabricator
 
-A comprehensive JSONL conversation processing toolkit for Claude Code sessions. Built with Bun and TypeScript.
+A conversation processing and session-conversion toolkit for Claude Code, OpenAI Codex, and Gemini CLI. Built with Bun and TypeScript.
 
 ## Features
 
 - **Conversation Pipeline**: Process Claude JSONL files to identify, remove, and replace content
-- **Session Conversion**: Bidirectional conversion between Claude Code and OpenAI Codex formats
-- **Codex Session Cloning**: Duplicate a Codex session file with a new session ID
+- **Session Conversion**: All six conversion directions among Claude Code, OpenAI Codex, and Gemini CLI
+- **Real Codex Session Cloning**: Duplicate a real Codex session file with a new session ID
+- **Codex Session Seeding**: Preserve the real Codex client-authored frame while replacing only the task turn payload
 - **Line Appending**: Programmatically add new conversation lines to existing sessions
 - **Conversation Extension**: Automatically extend conversations with additional exchanges
 
@@ -33,6 +34,12 @@ bun run src/index.ts --to-claude <codex-session-file>
 
 # Clone a Codex session (duplicate with new ID)
 bun run src/index.ts --clone-codex <session-id|codex-session-file> [output-dir]
+
+# Clone a real Codex session skeleton explicitly
+bun run src/index.ts --clone-real-codex-session <session-id|codex-session-file> [output-dir]
+
+# Seed a cloned real Codex skeleton with a new task prompt
+bun run src/index.ts --seed-codex <session-id|codex-session-file> <prompt-file> [output-dir]
 
 # Add lines to a session
 bun run src/index.ts --add-user <session-id> "Hello!"
@@ -111,7 +118,24 @@ if (verification.valid) {
 
 ## 2. Session Conversion
 
-Convert session files between Claude Code (`~/.claude/projects/`) and OpenAI Codex (`~/.codex/sessions/`) formats.
+Convert session files among Claude Code (`~/.claude/projects/`), OpenAI Codex (`~/.codex/sessions/`), and Gemini CLI (`~/.gemini/tmp/*/chats/`) formats.
+
+Important:
+
+- **Synthetic conversion is useful for analysis and interchange**
+- **Real-session cloning plus seeding is preferred for resume-quality Codex session bootstrapping**
+- Current Codex desktop sessions include richer framing than a naive converter can safely recreate from Claude alone
+- Gemini CLI chat JSON is supported. Antigravity's `~/.gemini/antigravity-cli/` SQLite store and `brain/*.jsonl` execution logs are different formats and are not treated as Gemini CLI resume files.
+
+### Current JSONL Coverage
+
+- Claude user content in both string and block-array form
+- Claude text, thinking, fallback, image, document, tool-use, and tool-result blocks, including array tool outputs
+- Claude metadata-first files and current auxiliary record counts (`attachment`, `mode`, `atis-latch`, `last-prompt`, `system`, and related records)
+- Current Codex `custom_tool_call`, `custom_tool_call_output`, `tool_search_call`, `tool_search_output`, `agent_message`, image, developer-message, and compaction records
+- Legacy Codex response items stored directly as top-level `message`, `reasoning`, `function_call`, and `function_call_output` records
+- Event-only Codex completed items when their matching `response_item` records are absent
+- Explicit warnings for provider-runtime metadata that has no safe target-session equivalent
 
 ### Convert Claude to Codex
 
@@ -145,6 +169,12 @@ bun run src/index.ts --to-claude ~/.codex/sessions/2025/01/13/rollout-abc.jsonl
 bun run src/index.ts --to-claude ~/.codex/sessions/2025/01/13/rollout-abc.jsonl ./converted/
 ```
 
+### Convert to Gemini CLI
+
+```bash
+bun run src/index.ts --to-gemini <claude-or-codex-file> [output-dir] [--cwd <dir>]
+```
+
 ### List Available Sessions
 
 ```bash
@@ -156,6 +186,9 @@ bun run src/index.ts --list-sessions claude
 
 # List only Codex sessions
 bun run src/index.ts --list-sessions codex
+
+# List only Gemini CLI sessions
+bun run src/index.ts --list-sessions gemini
 ```
 
 ### Clone a Codex Session (New Session ID)
@@ -200,18 +233,24 @@ import {
   convertCodexToClaude,
   convertClaudeFileToCodex,
   convertCodexFileToClaude,
+  convertClaudeFileToGemini,
+  convertGeminiFileToClaude,
+  convertGeminiFileToCodex,
+  convertCodexFileToGemini,
   detectSessionFormat,
   listClaudeSessions,
   listCodexSessions,
+  listGeminiSessions,
 } from "fabricator";
 
 // Detect session format automatically
 const format = await detectSessionFormat("/path/to/session.jsonl");
-console.log(`Detected format: ${format}`); // "claude" or "codex"
+console.log(`Detected format: ${format}`); // "claude", "codex", or "gemini"
 
 // List available sessions
 const claudeSessions = await listClaudeSessions();
 const codexSessions = await listCodexSessions();
+const geminiSessions = await listGeminiSessions();
 
 // Parse sessions
 const claudeSession = await parseClaudeSession("/path/to/claude/session.jsonl");
@@ -249,8 +288,12 @@ const result2 = await convertCodexFileToClaude("/path/to/codex/session.jsonl", {
 | `assistant` | `response_item` (message, role: assistant) + `event_msg` (agent_message) |
 | `tool_use` | `response_item` (function_call) |
 | `tool_result` | `response_item` (function_call_output) |
-| `thinking` | `response_item` (reasoning) - *encrypted in Codex* |
-| `summary` | *No direct equivalent* |
+| `thinking` | `response_item` (reasoning summary) |
+| `fallback` | Assistant text marker preserving the source and target model |
+| `image` | `response_item` (`input_image`) |
+| `summary` and readable `system` content | `response_item` (message, role: developer) |
+
+Codex-to-Claude conversion also maps custom and legacy tool calls, array outputs, input images, inter-agent messages, developer messages, and compaction summaries. `world_state` and inter-agent runtime-control metadata remain source-only because Claude has no safe resume equivalent.
 
 ---
 
@@ -608,8 +651,9 @@ bun run src/index.ts <session-id> <topic> [options]
 # Session Conversion
 bun run src/index.ts --to-codex <input-file> [output-dir]
 bun run src/index.ts --to-claude <input-file> [output-dir]
+bun run src/index.ts --to-gemini <input-file> [output-dir]
 bun run src/index.ts --clone-codex <session-id|codex-session-file> [output-dir]
-bun run src/index.ts --list-sessions [claude|codex]
+bun run src/index.ts --list-sessions [claude|codex|gemini]
 
 # Line Appending
 bun run src/index.ts --add-user <session-id> "<text>"
@@ -630,8 +674,9 @@ bun run src/index.ts --add-dsl <session-id> "<dsl-string>"
 
 | Command | Description |
 |---------|-------------|
-| `--to-codex` | Convert Claude Code session to Codex format |
-| `--to-claude` | Convert Codex session to Claude Code format |
+| `--to-codex` | Convert Claude Code or Gemini CLI sessions to Codex format |
+| `--to-claude` | Convert Codex or Gemini CLI sessions to Claude Code format |
+| `--to-gemini` | Convert Claude Code or Codex session to Gemini CLI format |
 | `--clone-codex` | Clone a Codex session to a new session ID |
 | `--list-sessions` | List available sessions |
 
@@ -663,11 +708,9 @@ bun test tests/pipeline.test.ts
 bun test --coverage
 ```
 
-### Test Summary
-
-- **69 tests** across 7 test files
-- **222 assertions**
-- Covers pipeline, conversion, and line appending functionality
+The suite covers pipeline behavior, all conversion directions, current and legacy
+JSONL records, target-directory routing, real-session cloning and seeding, and line
+appending.
 
 ---
 
@@ -705,6 +748,9 @@ fabricator/
 |----------|-------------|---------|
 | `HOME` | Home directory for session lookup | System default |
 | `ANTHROPIC_API_KEY` | API key for Claude integration | Required for pipeline |
+| `AGENT_CLAUDE_MODEL` | Claude model written into converted assistant records | `claude-opus-5` |
+| `AGENT_CLAUDE_VERSION` | Claude CLI version written into converted records | `2.1.170` |
+| `AGENT_CODEX_VERSION` | Codex CLI version written into converted metadata | `0.130.0` |
 
 ---
 

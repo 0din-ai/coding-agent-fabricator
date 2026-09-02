@@ -320,7 +320,11 @@ describe("Session Converter", () => {
 
       expect(result.success).toBe(true);
       expect(result.warnings.length).toBeGreaterThan(0);
-      expect(result.warnings[0]).toContain("Thinking content stored as summary");
+      expect(
+        result.warnings.some((warning) =>
+          warning.includes("Thinking content stored as summary")
+        )
+      ).toBe(true);
     });
   });
 
@@ -515,9 +519,10 @@ describe("Session Converter", () => {
       // Check that user message content is preserved
       const userMsg = finalSession.messages[0];
       expect(userMsg?.type).toBe("user");
-      const userContent = (userMsg as ClaudeUserRecord).message.content.find(
-        (c) => c.type === "text"
-      );
+      const content = (userMsg as ClaudeUserRecord).message.content;
+      const userContent = Array.isArray(content)
+        ? content.find((block) => block.type === "text")
+        : undefined;
       expect(userContent?.text).toContain("Hello, can you help me?");
     });
   });
