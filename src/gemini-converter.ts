@@ -260,7 +260,15 @@ function serializeClaudeToolResultsAsGeminiUserMessage(
 }
 
 function isGeminiFunctionResponseMessage(content: string): boolean {
-  return /^\[Function Response:\s*[^\]]+\]/.test(content.trim());
+  const trimmed = content.trim();
+  const prefix = "[Function Response:";
+  if (!trimmed.startsWith(prefix)) return false;
+
+  const closingBracket = trimmed.indexOf("]", prefix.length);
+  return (
+    closingBracket > prefix.length &&
+    trimmed.slice(prefix.length, closingBracket).trim().length > 0
+  );
 }
 
 function extractClaudeToolResultsFromGemini(
