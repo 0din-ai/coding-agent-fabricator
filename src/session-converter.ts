@@ -6,6 +6,8 @@
  */
 
 import { mkdir, readdir } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { join, basename, dirname } from "node:path";
 import {
   getCurrentDateString,
@@ -1212,6 +1214,28 @@ export async function parseClaudeSession(filePath: string): Promise<ClaudeSessio
   };
 }
 
+async function readClaudeSessionCwd(filePath: string): Promise<string | undefined> {
+  const input = createReadStream(filePath, { encoding: "utf8" });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const record = JSON.parse(line) as { cwd?: unknown };
+        if (typeof record.cwd === "string" && record.cwd) return record.cwd;
+      } catch {
+        // Skip malformed records.
+      }
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+
+  return undefined;
+}
+
 /**
  * List all Claude Code sessions
  */
@@ -1228,13 +1252,8 @@ export async function listClaudeSessions(
     const projectDirs = await readdir(projectsDir);
 
     for (const dir of projectDirs) {
-      const decodedPath = "/" + dir.replace(/^-/, "").replace(/-/g, "/");
-
-      if (projectPath && !decodedPath.includes(projectPath)) {
-        continue;
-      }
-
       const projectDir = join(projectsDir, dir);
+      const fallbackProjectPath = "/" + dir.replace(/^-/, "").replace(/-/g, "/");
 
       try {
         const files = await readdir(projectDir);
@@ -1242,6 +1261,13 @@ export async function listClaudeSessions(
 
         for (const file of jsonlFiles) {
           const filePath = join(projectDir, file);
+          const storedProjectPath =
+            (await readClaudeSessionCwd(filePath)) || fallbackProjectPath;
+
+          if (projectPath && !storedProjectPath.includes(projectPath)) {
+            continue;
+          }
+
           const sessionId = basename(file, ".jsonl");
           const stat = await Bun.file(filePath).stat();
 
@@ -1250,7 +1276,7 @@ export async function listClaudeSessions(
             format: "claude",
             sessionId,
             timestamp: stat?.mtime?.toISOString() || new Date().toISOString(),
-            project: decodedPath,
+            project: storedProjectPath,
           });
         }
       } catch {

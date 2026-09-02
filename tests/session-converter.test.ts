@@ -1,6 +1,7 @@
 import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { slugifyClaudeProjectPath } from "../src/session-routing";
 import {
   parseClaudeSession,
   parseCodexSession,
@@ -222,6 +223,38 @@ describe("Session Converter", () => {
 
       expect(session.messages.length).toBe(0);
       expect(session.sessionId).toBe("empty"); // Falls back to filename
+    });
+  });
+
+  describe("Claude Session Listing", () => {
+    test("uses the stored cwd instead of decoding the project directory slug", async () => {
+      const originalHome = process.env.HOME;
+      const testHome = join(TEST_DIR, "listing-home");
+      const storedCwd = "/workspace/my_project/release.v1";
+      const projectDir = join(
+        testHome,
+        ".claude",
+        "projects",
+        slugifyClaudeProjectPath(storedCwd)
+      );
+      const sessionId = "stored-cwd-session";
+      const content = createClaudeJsonl(sessionId).replaceAll(
+        "/test/project",
+        storedCwd
+      );
+
+      await mkdir(projectDir, { recursive: true });
+      await Bun.write(join(projectDir, `${sessionId}.jsonl`), content);
+      process.env.HOME = testHome;
+
+      try {
+        const sessions = await listClaudeSessions("my_project/release.v1");
+        expect(sessions).toHaveLength(1);
+        expect(sessions[0]?.project).toBe(storedCwd);
+      } finally {
+        if (originalHome === undefined) delete process.env.HOME;
+        else process.env.HOME = originalHome;
+      }
     });
   });
 

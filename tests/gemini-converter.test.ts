@@ -358,6 +358,18 @@ describe("Gemini Converter", () => {
     }
   });
 
+  test("convertClaudeToGemini rejects a project hash that conflicts with target cwd", async () => {
+    const claudeSession = createClaudeSession();
+
+    await expect(
+      convertClaudeToGemini(claudeSession, {
+        outputDir: GEMINI_OUTPUT_DIR,
+        targetCwd: TARGET_CWD,
+        projectHash: "not-the-target-cwd-hash",
+      })
+    ).rejects.toThrow("projectHash must match the SHA-256 hash of targetCwd");
+  });
+
   test("detectSessionFormat identifies Gemini chat files", async () => {
     const claudeSession = createClaudeSession();
     const result = await convertClaudeToGemini(claudeSession, {

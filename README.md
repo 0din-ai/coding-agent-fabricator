@@ -120,6 +120,9 @@ if (verification.valid) {
 
 Convert session files among Claude Code (`~/.claude/projects/`), OpenAI Codex (`~/.codex/sessions/`), and Gemini CLI (`~/.gemini/tmp/*/chats/`) formats.
 
+CLI conversions target the caller's current working directory when `--cwd` is
+omitted. Pass `--cwd <dir>` to route the converted session to another workspace.
+
 Important:
 
 - **Synthetic conversion is useful for analysis and interchange**

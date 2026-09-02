@@ -395,6 +395,9 @@ export async function convertClaudeToGemini(
 
   const effectiveCwd = targetCwd || claudeSession.metadata.cwd;
   const projectLocation = await resolveGeminiProjectLocation(effectiveCwd, outputDir);
+  if (customProjectHash && customProjectHash !== projectLocation.projectHash) {
+    throw new Error("projectHash must match the SHA-256 hash of targetCwd");
+  }
   await ensureGeminiProjectLocation(projectLocation);
 
   const warnings: string[] = [];
@@ -580,7 +583,7 @@ export async function convertClaudeToGemini(
 
   const geminiSession: GeminiSession = {
     sessionId,
-    projectHash: customProjectHash || projectLocation.projectHash,
+    projectHash: projectLocation.projectHash,
     startTime: firstTimestamp,
     lastUpdated: lastTimestamp,
     messages: geminiMessages,
