@@ -36,6 +36,7 @@ export type { ProcessorResult, UpdateResult } from "./jsonl-processor";
 // Session Converter exports
 export {
   parseClaudeSession,
+  parseCodexFile,
   parseCodexSession,
   convertClaudeToCodex,
   convertCodexToClaude,
@@ -57,12 +58,30 @@ export type {
   SessionListEntry,
 } from "./session-converter";
 
+// Codex session seeder exports
+export {
+  cloneRealCodexSession,
+  seedCodexSessionFromSkeleton,
+} from "./codex-session-seeder";
+
+export type {
+  CloneRealCodexSessionResult,
+  SeedCodexSessionOptions,
+  SeedCodexSessionResult,
+} from "./codex-session-seeder";
+
 // Gemini Converter exports
 export {
   parseGeminiSession,
   listGeminiSessions,
   convertClaudeToGemini,
   convertClaudeFileToGemini,
+  convertGeminiToClaude,
+  convertGeminiFileToClaude,
+  convertGeminiToCodex,
+  convertGeminiFileToCodex,
+  convertCodexToGemini,
+  convertCodexFileToGemini,
   isGeminiFormat,
 } from "./gemini-converter";
 
@@ -74,8 +93,11 @@ export type {
   GeminiThought,
   GeminiTokens,
   ClaudeToGeminiOptions,
+  GeminiToClaudeOptions,
+  GeminiToCodexOptions,
   GeminiConversionResult,
   GeminiSessionListEntry,
+  GeminiToolCall,
 } from "./gemini-converter";
 
 // Session Line Appender exports
@@ -105,38 +127,90 @@ export type {
 if (import.meta.main) {
   const args = process.argv.slice(2);
 
+  function parseConversionArgs(commandArgs: string[]) {
+    const positionals: string[] = [];
+    let targetCwd = process.cwd();
+
+    for (let i = 0; i < commandArgs.length; i++) {
+      const arg = commandArgs[i]!;
+
+      if (arg === "--cwd") {
+        const value = commandArgs[i + 1];
+        if (!value) {
+          throw new Error("Missing value for --cwd");
+        }
+        targetCwd = value;
+        i++;
+        continue;
+      }
+
+      positionals.push(arg);
+    }
+
+    return {
+      inputFile: positionals[0],
+      outputDir: positionals[1],
+      targetCwd,
+    };
+  }
+
   // Check for conversion commands first
   if (args[0] === "--to-gemini") {
-    const inputFile = args[1];
+    let parsedArgs;
+
+    try {
+      parsedArgs = parseConversionArgs(args.slice(1));
+    } catch (error) {
+      console.error(String(error));
+      process.exit(1);
+    }
+
+    const { inputFile, outputDir, targetCwd } = parsedArgs;
 
     if (!inputFile) {
-      console.log("Usage: bun run src/index.ts --to-gemini <input-file> [output-dir]");
+      console.log("Usage: bun run src/index.ts --to-gemini <input-file> [output-dir] [--cwd <dir>]");
       console.log("");
       console.log("Convert Claude Code or Codex session files to Gemini format.");
       console.log("");
       console.log("Examples:");
       console.log("  bun run src/index.ts --to-gemini ~/.claude/projects/-path/session.jsonl");
-      console.log("  bun run src/index.ts --to-gemini ~/.claude/projects/-path/session.jsonl ~/.gemini/tmp/hash/chats/");
+      console.log("  bun run src/index.ts --to-gemini ~/.codex/sessions/2026/03/04/rollout-xxx.jsonl");
+      console.log("  bun run src/index.ts --to-gemini ~/.claude/projects/-path/session.jsonl --cwd $(pwd)");
       process.exit(1);
     }
 
-    const outputDir = args[2];
-
-    const { convertClaudeFileToGemini } = await import("./gemini-converter");
+    const { convertClaudeFileToGemini, convertCodexFileToGemini } = await import(
+      "./gemini-converter"
+    );
     const { detectSessionFormat } = await import("./session-converter");
 
     try {
       const format = await detectSessionFormat(inputFile);
 
-      if (format === "codex") {
-        console.error("Error: Direct Codex → Gemini conversion not yet supported. Convert to Claude first.");
+      if (format === "unknown") {
+        console.error("Error: Could not detect input session format");
         process.exit(1);
       }
 
-      console.log("Converting Claude Code session to Gemini format...");
-      const result = await convertClaudeFileToGemini(inputFile, {
-        outputDir,
-      });
+      if (format === "gemini") {
+        console.error("Error: Input file is already in Gemini format");
+        process.exit(1);
+      }
+
+      const result =
+        format === "codex"
+          ? await convertCodexFileToGemini(inputFile, {
+              outputDir,
+              targetCwd,
+            })
+          : await convertClaudeFileToGemini(inputFile, {
+              outputDir,
+              targetCwd,
+            });
+
+      console.log(
+        `Converting ${format === "codex" ? "Codex" : "Claude Code"} session to Gemini format...`
+      );
 
       console.log("\n=== Conversion Result ===");
       console.log(`Success: ${result.success}`);
@@ -166,30 +240,46 @@ if (import.meta.main) {
 
   if (args[0] === "--to-codex" || args[0] === "--to-claude") {
     const isToCodex = args[0] === "--to-codex";
-    const inputFile = args[1];
+    let parsedArgs;
 
-    if (!inputFile) {
-      console.log(`Usage: bun run src/index.ts ${args[0]} <input-file> [output-dir]`);
-      console.log("");
-      console.log("Convert session files between Claude Code and Codex formats.");
-      console.log("");
-      console.log("Examples:");
-      console.log(`  bun run src/index.ts --to-codex ~/.claude/projects/-path/session.jsonl`);
-      console.log(`  bun run src/index.ts --to-claude ~/.codex/sessions/2026/01/13/rollout-xxx.jsonl`);
+    try {
+      parsedArgs = parseConversionArgs(args.slice(1));
+    } catch (error) {
+      console.error(String(error));
       process.exit(1);
     }
 
-    const outputDir = args[2];
+    const { inputFile, outputDir, targetCwd } = parsedArgs;
+
+    if (!inputFile) {
+      console.log(`Usage: bun run src/index.ts ${args[0]} <input-file> [output-dir] [--cwd <dir>]`);
+      console.log("");
+      console.log("Convert session files between Claude Code, Gemini, and Codex formats.");
+      console.log("");
+      console.log("Examples:");
+      console.log(`  bun run src/index.ts --to-codex ~/.claude/projects/-path/session.jsonl`);
+      console.log(`  bun run src/index.ts --to-codex ~/.gemini/tmp/project/chats/session-xxx.json`);
+      console.log(`  bun run src/index.ts --to-claude ~/.codex/sessions/2026/01/13/rollout-xxx.jsonl`);
+      console.log(`  bun run src/index.ts --to-claude ~/.gemini/tmp/project/chats/session-xxx.json --cwd $(pwd)`);
+      process.exit(1);
+    }
 
     const {
       convertClaudeFileToCodex,
       convertCodexFileToClaude,
       detectSessionFormat,
     } = await import("./session-converter");
+    const { convertGeminiFileToClaude, convertGeminiFileToCodex } = await import(
+      "./gemini-converter"
+    );
 
     try {
-      // Auto-detect format if needed
       const format = await detectSessionFormat(inputFile);
+
+      if (format === "unknown") {
+        console.error("Error: Could not detect input session format");
+        process.exit(1);
+      }
 
       if (isToCodex) {
         if (format === "codex") {
@@ -197,11 +287,22 @@ if (import.meta.main) {
           process.exit(1);
         }
 
-        console.log("Converting Claude Code session to Codex format...");
-        const result = await convertClaudeFileToCodex(inputFile, {
-          outputDir,
-          preserveMetadata: true,
-        });
+        const result =
+          format === "gemini"
+            ? await convertGeminiFileToCodex(inputFile, {
+                outputDir,
+                preserveMetadata: true,
+                targetCwd,
+              })
+            : await convertClaudeFileToCodex(inputFile, {
+                outputDir,
+                preserveMetadata: true,
+                targetCwd,
+              });
+
+        console.log(
+          `Converting ${format === "gemini" ? "Gemini" : "Claude Code"} session to Codex format...`
+        );
 
         console.log("\n=== Conversion Result ===");
         console.log(`Success: ${result.success}`);
@@ -226,12 +327,24 @@ if (import.meta.main) {
           process.exit(1);
         }
 
-        console.log("Converting Codex session to Claude Code format...");
-        const result = await convertCodexFileToClaude(inputFile, {
-          outputDir,
-          generateUuids: true,
-          reconstructThreading: true,
-        });
+        const result =
+          format === "gemini"
+            ? await convertGeminiFileToClaude(inputFile, {
+                outputDir,
+                generateUuids: true,
+                targetCwd,
+              })
+            : await convertCodexFileToClaude(inputFile, {
+                outputDir,
+                generateUuids: true,
+                reconstructThreading: true,
+                projectPath: targetCwd,
+                targetCwd,
+              });
+
+        console.log(
+          `Converting ${format === "gemini" ? "Gemini" : "Codex"} session to Claude Code format...`
+        );
 
         console.log("\n=== Conversion Result ===");
         console.log(`Success: ${result.success}`);
@@ -278,171 +391,91 @@ if (import.meta.main) {
       process.exit(1);
     }
 
-    const { mkdir } = await import("node:fs/promises");
-    const { existsSync } = await import("node:fs");
-    const { basename, dirname, join } = await import("node:path");
+    const { cloneRealCodexSession } = await import("./codex-session-seeder");
 
-    const homeDir = process.env.HOME || Bun.env.HOME;
-    if (!homeDir) {
-      console.error("Error: HOME is not set");
-      process.exit(1);
-    }
-
-    // Resolve source file path.
-    let srcFilePath: string;
-    if (sessionIdOrFile.includes("/") || sessionIdOrFile.endsWith(".jsonl")) {
-      srcFilePath = sessionIdOrFile;
-    } else {
-      const sessionId = sessionIdOrFile;
-      const sessionsRoot = join(homeDir, ".codex", "sessions");
-
-      const matches: string[] = [];
-      const glob1 = new Bun.Glob(`${sessionsRoot}/**/rollout-*-${sessionId}.jsonl`);
-      for await (const file of glob1.scan({ absolute: true })) {
-        matches.push(file);
-      }
-
-      if (matches.length === 0) {
-        const glob2 = new Bun.Glob(`${sessionsRoot}/**/*${sessionId}*.jsonl`);
-        for await (const file of glob2.scan({ absolute: true })) {
-          matches.push(file);
-        }
-      }
-
-      if (matches.length === 0) {
-        console.error(`Error: Could not find Codex session file for: ${sessionId}`);
-        process.exit(1);
-      }
-
-      // If multiple matches exist, pick the newest by mtime.
-      let bestPath = matches[0]!;
-      let bestMtime = 0;
-      for (const p of matches) {
-        try {
-          const st = await Bun.file(p).stat();
-          const mtime = st?.mtime ? st.mtime.getTime() : 0;
-          if (mtime >= bestMtime) {
-            bestMtime = mtime;
-            bestPath = p;
-          }
-        } catch {
-          // ignore
-        }
-      }
-
-      srcFilePath = bestPath;
-    }
-
-    if (!existsSync(srcFilePath)) {
-      console.error(`Error: Source file does not exist: ${srcFilePath}`);
-      process.exit(1);
-    }
-
-    const srcText = await Bun.file(srcFilePath).text();
-    const firstNonEmptyLine = srcText
-      .split("\n")
-      .find((l) => l.trim().length > 0);
-
-    if (!firstNonEmptyLine) {
-      console.error("Error: Source file is empty");
-      process.exit(1);
-    }
-
-    // Determine the actual old session ID from session_meta.
-    let oldSessionId = sessionIdOrFile;
     try {
-      const meta = JSON.parse(firstNonEmptyLine) as Record<string, unknown>;
-      const payload = meta.payload as Record<string, unknown> | undefined;
-      const id = payload?.id;
-      if (meta.type === "session_meta" && typeof id === "string" && id.length > 0) {
-        oldSessionId = id;
-      }
-    } catch {
-      // ignore; we'll fall back to the argument
+      const result = await cloneRealCodexSession(sessionIdOrFile, outputDirArg);
+      console.log("=== Clone Result ===");
+      console.log(`Source: ${result.sourcePath}`);
+      console.log(`Destination: ${result.destinationPath}`);
+      console.log(`Old ID: ${result.oldSessionId}`);
+      console.log(`New ID: ${result.newSessionId}`);
+      console.log("");
+      console.log("✅ Codex session cloned successfully");
+      process.exit(0);
+    } catch (error) {
+      console.error("Clone failed:", error);
+      process.exit(1);
     }
+  }
 
-    if (typeof oldSessionId !== "string" || oldSessionId.length === 0) {
-      console.error("Error: Could not determine old session ID");
+  if (args[0] === "--clone-real-codex-session") {
+    const sessionIdOrFile = args[1];
+    const outputDir = args[2];
+
+    if (!sessionIdOrFile) {
+      console.log(
+        "Usage: bun run src/index.ts --clone-real-codex-session <session-id|file> [output-dir]"
+      );
       process.exit(1);
     }
 
-    const srcDir = dirname(srcFilePath);
-    const srcBase = basename(srcFilePath);
+    const { cloneRealCodexSession } = await import("./codex-session-seeder");
 
-    const outputDir = outputDirArg || srcDir;
-    await mkdir(outputDir, { recursive: true });
-
-    // Generate a new ID and an unused destination path.
-    let newSessionId = "";
-    let destFilePath = "";
-    for (let attempt = 0; attempt < 25; attempt++) {
-      const candidateId = crypto.randomUUID();
-
-      // Prefer keeping the same filename shape if it contains the old ID.
-      const candidateBase = srcBase.includes(oldSessionId)
-        ? srcBase.replaceAll(oldSessionId, candidateId)
-        : `rollout-${new Date().toISOString().replace(/:/g, "-").replace(/\.\d{3}Z$/, "")}-${candidateId}.jsonl`;
-
-      const candidatePath = join(outputDir, candidateBase);
-
-      if (!existsSync(candidatePath)) {
-        newSessionId = candidateId;
-        destFilePath = candidatePath;
-        break;
-      }
-    }
-
-    if (!destFilePath) {
-      console.error("Error: Failed to generate a unique destination file path");
-      process.exit(1);
-    }
-
-    const destText = srcText.replaceAll(oldSessionId, newSessionId);
-    await Bun.write(destFilePath, destText);
-
-    // Strict JSONL validation (fail fast if any line is malformed).
-    const lines = destText.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]!;
-      if (!line.trim()) continue;
-      try {
-        JSON.parse(line);
-      } catch (e) {
-        console.error(`Error: Malformed JSON on line ${i + 1}`);
-        console.error(String(e));
-        process.exit(1);
-      }
-    }
-
-    // Verify session_meta payload.id == newSessionId.
     try {
-      const meta = JSON.parse(firstNonEmptyLine) as Record<string, unknown>;
-      void meta; // original meta unused (kept for clarity)
-      const destFirst = destText.split("\n").find((l) => l.trim().length > 0)!;
-      const destMeta = JSON.parse(destFirst) as Record<string, unknown>;
-      const payload = destMeta.payload as Record<string, unknown> | undefined;
-      if (destMeta.type !== "session_meta" || payload?.id !== newSessionId) {
-        console.error("Error: session_meta payload.id was not updated in the cloned file");
-        process.exit(1);
-      }
-    } catch {
-      console.error("Error: Failed to validate cloned session_meta");
+      const result = await cloneRealCodexSession(sessionIdOrFile, outputDir);
+      console.log("=== Clone Result ===");
+      console.log(`Source: ${result.sourcePath}`);
+      console.log(`Destination: ${result.destinationPath}`);
+      console.log(`Old ID: ${result.oldSessionId}`);
+      console.log(`New ID: ${result.newSessionId}`);
+      console.log("");
+      console.log("✅ Real Codex session cloned successfully");
+      process.exit(0);
+    } catch (error) {
+      console.error("Clone failed:", error);
+      process.exit(1);
+    }
+  }
+
+  if (args[0] === "--seed-codex") {
+    const sessionIdOrFile = args[1];
+    const promptFile = args[2];
+    const outputDir = args[3];
+
+    if (!sessionIdOrFile || !promptFile) {
+      console.log("Usage: bun run src/index.ts --seed-codex <session-id|file> <prompt-file> [output-dir]");
+      console.log("");
+      console.log("Clone a real Codex session skeleton and replace only the task turn payload.");
+      console.log("");
+      console.log("Examples:");
+      console.log("  bun run src/index.ts --seed-codex 019cc12e-... ./prompt.md");
+      console.log("  bun run src/index.ts --seed-codex ~/.codex/sessions/...jsonl ./prompt.md ./seeded");
       process.exit(1);
     }
 
-    if (destText.includes(oldSessionId)) {
-      console.error("Error: Old session ID still present in cloned file");
+    const { seedCodexSessionFromSkeleton } = await import("./codex-session-seeder");
+
+    try {
+      const promptText = await Bun.file(promptFile).text();
+      const result = await seedCodexSessionFromSkeleton({
+        sessionIdOrFile,
+        promptText,
+        outputDir,
+      });
+
+      console.log("=== Seed Result ===");
+      console.log(`Source: ${result.sourcePath}`);
+      console.log(`Seeded: ${result.seededPath}`);
+      console.log(`Old ID: ${result.oldSessionId}`);
+      console.log(`New ID: ${result.newSessionId}`);
+      console.log("");
+      console.log("✅ Codex session seeded successfully");
+      process.exit(0);
+    } catch (error) {
+      console.error("Seed failed:", error);
       process.exit(1);
     }
-
-    console.log("=== Clone Result ===");
-    console.log(`Source: ${srcFilePath}`);
-    console.log(`Destination: ${destFilePath}`);
-    console.log(`Old ID: ${oldSessionId}`);
-    console.log(`New ID: ${newSessionId}`);
-    console.log("");
-    console.log("✅ Codex session cloned successfully");
-    process.exit(0);
   }
 
   // Check for list sessions command
@@ -699,19 +732,25 @@ if (import.meta.main) {
     console.log("");
     console.log("Usage:");
     console.log("  bun run src/index.ts <session-id> <topic> [options]");
-    console.log("  bun run src/index.ts --to-codex <input-file> [output-dir]");
-    console.log("  bun run src/index.ts --to-claude <input-file> [output-dir]");
+    console.log("  bun run src/index.ts --to-codex <input-file> [output-dir] [--cwd <dir>]");
+    console.log("  bun run src/index.ts --to-claude <input-file> [output-dir] [--cwd <dir>]");
+    console.log("  bun run src/index.ts --to-gemini <input-file> [output-dir] [--cwd <dir>]");
     console.log("  bun run src/index.ts --clone-codex <session-id|file> [output-dir]");
-    console.log("  bun run src/index.ts --list-sessions [claude|codex]");
+    console.log("  bun run src/index.ts --clone-real-codex-session <session-id|file> [output-dir]");
+    console.log("  bun run src/index.ts --seed-codex <session-id|file> <prompt-file> [output-dir]");
+    console.log("  bun run src/index.ts --list-sessions [claude|codex|gemini]");
     console.log("  bun run src/index.ts --add-<type> <session-id> <args...>");
     console.log("");
     console.log("Pipeline Options:");
     console.log("  --extend, -e <count>  Add additional conversation exchanges");
     console.log("");
     console.log("Conversion Commands:");
-    console.log("  --to-codex            Convert Claude Code session to Codex format");
-    console.log("  --to-claude           Convert Codex session to Claude Code format");
-    console.log("  --to-gemini           Convert Claude Code session to Gemini format");
+    console.log("  --to-codex            Convert Claude Code or Gemini session to Codex format");
+    console.log("  --to-claude           Convert Codex or Gemini session to Claude Code format");
+    console.log("  --to-gemini           Convert Claude Code or Codex session to Gemini format");
+    console.log("  --clone-codex         Duplicate a Codex session with a new ID");
+    console.log("  --clone-real-codex-session Clone a real Codex session skeleton");
+    console.log("  --seed-codex          Clone a real Codex session skeleton and replace the task turn");
     console.log("  --list-sessions       List available sessions (claude|codex|gemini)");
     console.log("");
     console.log("Line Appending Commands:");
@@ -725,8 +764,10 @@ if (import.meta.main) {
     console.log("Examples:");
     console.log('  bun run src/index.ts abc123 "helping with TypeScript"');
     console.log('  bun run src/index.ts abc123 "helping with TypeScript" --extend 5');
-    console.log("  bun run src/index.ts --to-codex ~/.claude/projects/session.jsonl");
-    console.log("  bun run src/index.ts --to-claude ~/.codex/sessions/rollout.jsonl");
+    console.log("  bun run src/index.ts --to-codex ~/.claude/projects/session.jsonl --cwd $(pwd)");
+    console.log("  bun run src/index.ts --to-codex ~/.gemini/tmp/project/chats/session.json --cwd $(pwd)");
+    console.log("  bun run src/index.ts --to-claude ~/.codex/sessions/rollout.jsonl --cwd $(pwd)");
+    console.log("  bun run src/index.ts --to-gemini ~/.codex/sessions/rollout.jsonl --cwd $(pwd)");
     console.log('  bun run src/index.ts --add-user abc123 "Hello, Claude!"');
     console.log('  bun run src/index.ts --add-tool abc123 Read \'{"file_path": "/tmp/test.txt"}\'');
     process.exit(1);

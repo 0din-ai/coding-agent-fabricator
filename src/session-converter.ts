@@ -6,7 +6,14 @@
  */
 
 import { mkdir, readdir } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { join, basename, dirname } from "node:path";
+import {
+  getCurrentDateString,
+  getCurrentTimezone,
+  slugifyClaudeProjectPath,
+} from "./session-routing";
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -25,7 +32,17 @@ export type ClaudeMessageType =
   | "assistant"
   | "summary"
   | "file-history-snapshot"
-  | "queue-operation";
+  | "queue-operation"
+  | "attachment"
+  | "last-prompt"
+  | "atis-latch"
+  | "mode"
+  | "ai-title"
+  | "pr-link"
+  | "system"
+  | "permission-mode"
+  | "bridge-session"
+  | "cost-state";
 
 export interface ClaudeTextBlock {
   type: "text";
@@ -37,12 +54,14 @@ export interface ClaudeToolUseBlock {
   id: string;
   name: string;
   input: Record<string, unknown>;
+  caller?: Record<string, unknown>;
 }
 
 export interface ClaudeToolResultBlock {
   type: "tool_result";
   tool_use_id: string;
-  content: string | Record<string, unknown>;
+  content: unknown;
+  is_error?: boolean;
 }
 
 export interface ClaudeThinkingBlock {
@@ -51,11 +70,41 @@ export interface ClaudeThinkingBlock {
   signature?: string;
 }
 
+export interface ClaudeFallbackBlock {
+  type: "fallback";
+  from: string;
+  to: string;
+}
+
+export interface ClaudeImageBlock {
+  type: "image";
+  source: {
+    type: string;
+    media_type?: string;
+    data?: string;
+    url?: string;
+    [key: string]: unknown;
+  };
+}
+
+export interface ClaudeDocumentBlock {
+  type: "document";
+  source: {
+    type: string;
+    media_type?: string;
+    data?: string;
+    [key: string]: unknown;
+  };
+}
+
 export type ClaudeContentBlock =
   | ClaudeTextBlock
   | ClaudeToolUseBlock
   | ClaudeToolResultBlock
-  | ClaudeThinkingBlock;
+  | ClaudeThinkingBlock
+  | ClaudeFallbackBlock
+  | ClaudeImageBlock
+  | ClaudeDocumentBlock;
 
 export interface ClaudeUsage {
   input_tokens: number;
@@ -82,7 +131,7 @@ export interface ClaudeUserRecord extends ClaudeRecordBase {
   type: "user";
   message: {
     role: "user";
-    content: ClaudeContentBlock[];
+    content: string | ClaudeContentBlock[];
   };
   slug?: string;
 }
@@ -119,11 +168,32 @@ export interface ClaudeFileHistorySnapshot {
   isSnapshotUpdate: boolean;
 }
 
+export interface ClaudeSystemRecord extends ClaudeRecordBase {
+  type: "system";
+  subtype: "informational";
+  content: string;
+  isMeta: true;
+  level: "info";
+  entrypoint: "cli";
+}
+
+export interface ClaudeAuxiliaryRecord {
+  type: Exclude<
+    ClaudeMessageType,
+    "user" | "assistant" | "summary" | "file-history-snapshot" | "system"
+  >;
+  sessionId?: UUID;
+  timestamp?: ISO8601Timestamp;
+  [key: string]: unknown;
+}
+
 export type ClaudeRecord =
   | ClaudeUserRecord
   | ClaudeAssistantRecord
   | ClaudeSummaryRecord
-  | ClaudeFileHistorySnapshot;
+  | ClaudeFileHistorySnapshot
+  | ClaudeSystemRecord
+  | ClaudeAuxiliaryRecord;
 
 export interface ClaudeSession {
   sessionId: UUID;
@@ -133,6 +203,7 @@ export interface ClaudeSession {
   messages: (ClaudeUserRecord | ClaudeAssistantRecord)[];
   summary?: ClaudeSummaryRecord;
   fileSnapshots: ClaudeFileHistorySnapshot[];
+  recordCounts?: Record<string, number>;
   metadata: {
     version: string;
     cwd: string;
@@ -152,10 +223,18 @@ export type CodexRecordType =
   | "session_meta"
   | "response_item"
   | "event_msg"
-  | "turn_context";
+  | "turn_context"
+  | "world_state"
+  | "compacted"
+  | "inter_agent_communication_metadata"
+  | "function_call"
+  | "function_call_output"
+  | "reasoning"
+  | "message";
 
 export interface CodexRecordBase {
-  timestamp: ISO8601Timestamp;
+  ordinal?: number;
+  timestamp?: ISO8601Timestamp;
   type: CodexRecordType;
 }
 
@@ -166,12 +245,15 @@ export interface CodexSessionMetaPayload {
   originator: string;
   cli_version: string;
   instructions: string | null;
-  source: string;
+  source: string | Record<string, unknown>;
   model_provider: string;
+  base_instructions?: string | { text: string } | null;
   git?: {
     commit_hash: string;
     branch: string;
+    repository_url?: string;
   };
+  [key: string]: unknown;
 }
 
 export interface CodexSessionMetaRecord extends CodexRecordBase {
@@ -179,17 +261,32 @@ export interface CodexSessionMetaRecord extends CodexRecordBase {
   payload: CodexSessionMetaPayload;
 }
 
+export interface CodexTextContent {
+  type: "input_text" | "output_text" | "text";
+  text: string;
+}
+
+export interface CodexImageContent {
+  type: "input_image";
+  image_url: string;
+  detail?: string;
+}
+
+export type CodexMessageContent = CodexTextContent | CodexImageContent;
+
 export interface CodexMessagePayload {
   type: "message";
-  role: "user" | "assistant";
-  content: Array<{ type: "input_text" | "output_text"; text: string }>;
+  role: "user" | "assistant" | "developer";
+  content: CodexMessageContent[];
+  [key: string]: unknown;
 }
 
 export interface CodexReasoningPayload {
   type: "reasoning";
-  content: null;
-  encrypted_content: string;
+  content?: unknown;
+  encrypted_content?: string;
   summary: Array<{ type: "summary_text"; text: string }>;
+  [key: string]: unknown;
 }
 
 export interface CodexFunctionCallPayload {
@@ -197,19 +294,85 @@ export interface CodexFunctionCallPayload {
   name: string;
   arguments: string;
   call_id: string;
+  namespace?: string;
+  [key: string]: unknown;
 }
 
 export interface CodexFunctionCallOutputPayload {
   type: "function_call_output";
   call_id: string;
-  output: string;
+  output: unknown;
+  [key: string]: unknown;
+}
+
+export interface CodexCustomToolCallPayload {
+  type: "custom_tool_call";
+  name: string;
+  input: string;
+  call_id: string;
+  status?: string;
+  [key: string]: unknown;
+}
+
+export interface CodexCustomToolCallOutputPayload {
+  type: "custom_tool_call_output";
+  call_id: string;
+  output: unknown;
+  name?: string;
+  [key: string]: unknown;
+}
+
+export interface CodexWebSearchCallPayload {
+  type: "web_search_call";
+  status?: string;
+  action: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface CodexToolSearchCallPayload {
+  type: "tool_search_call";
+  call_id: string;
+  arguments: Record<string, unknown>;
+  status?: string;
+  execution?: string;
+  [key: string]: unknown;
+}
+
+export interface CodexToolSearchOutputPayload {
+  type: "tool_search_output";
+  call_id: string;
+  tools: unknown[];
+  status?: string;
+  execution?: string;
+  [key: string]: unknown;
+}
+
+export interface CodexAgentMessagePayload {
+  type: "agent_message";
+  author: string;
+  recipient: string;
+  content: CodexMessageContent[];
+  [key: string]: unknown;
+}
+
+export interface CodexGhostSnapshotPayload {
+  type: "ghost_snapshot";
+  ghost_commit: Record<string, unknown>;
+  [key: string]: unknown;
 }
 
 export type CodexResponseItemPayload =
   | CodexMessagePayload
   | CodexReasoningPayload
   | CodexFunctionCallPayload
-  | CodexFunctionCallOutputPayload;
+  | CodexFunctionCallOutputPayload
+  | CodexCustomToolCallPayload
+  | CodexCustomToolCallOutputPayload
+  | CodexWebSearchCallPayload
+  | CodexToolSearchCallPayload
+  | CodexToolSearchOutputPayload
+  | CodexAgentMessagePayload
+  | CodexGhostSnapshotPayload;
 
 export interface CodexResponseItemRecord extends CodexRecordBase {
   type: "response_item";
@@ -247,7 +410,36 @@ export type CodexEventMsgPayload =
   | CodexUserMessageEvent
   | CodexAgentReasoningEvent
   | CodexAgentMessageEvent
-  | CodexTokenCountEvent;
+  | CodexTokenCountEvent
+  | ({
+      type:
+        | "item_completed"
+        | "exec_command_end"
+        | "patch_apply_end"
+        | "task_started"
+        | "task_complete"
+        | "thread_settings_applied"
+        | "context_compacted"
+        | "sub_agent_activity"
+        | "web_search_end"
+        | "turn_aborted"
+        | "mcp_tool_call_end"
+        | "view_image_tool_call"
+        | "image_generation_end"
+        | "dynamic_tool_call_request"
+        | "dynamic_tool_call_response"
+        | "error"
+        | "collab_waiting_end"
+        | "collab_agent_spawn_end"
+        | "collab_close_end"
+        | "collab_agent_interaction_end"
+        | "thread_goal_updated"
+        | "thread_name_updated"
+        | "thread_rolled_back"
+        | "turn_completed"
+        | "task_completed";
+      [key: string]: unknown;
+    });
 
 export interface CodexEventMsgRecord extends CodexRecordBase {
   type: "event_msg";
@@ -255,14 +447,22 @@ export interface CodexEventMsgRecord extends CodexRecordBase {
 }
 
 export interface CodexTurnContextPayload {
+  turn_id?: string;
   cwd: string;
-  approval_policy: string;
-  sandbox_policy: { type: string };
-  model: string;
-  effort: "high" | "medium" | "low";
-  summary: string;
-  user_instructions: string;
-  truncation_policy: { mode: string; limit: number };
+  current_date?: string;
+  timezone?: string;
+  approval_policy?: string;
+  sandbox_policy?: { type: string } | string;
+  model?: string;
+  personality?: string;
+  collaboration_mode?: Record<string, unknown>;
+  realtime_active?: boolean;
+  effort?: string;
+  summary?: string;
+  user_instructions?: string;
+  developer_instructions?: string;
+  truncation_policy?: { mode: string; limit: number };
+  [key: string]: unknown;
 }
 
 export interface CodexTurnContextRecord extends CodexRecordBase {
@@ -270,24 +470,61 @@ export interface CodexTurnContextRecord extends CodexRecordBase {
   payload: CodexTurnContextPayload;
 }
 
+export interface CodexWorldStateRecord extends CodexRecordBase {
+  type: "world_state";
+  payload: { full: boolean; state: Record<string, unknown> };
+}
+
+export interface CodexCompactedRecord extends CodexRecordBase {
+  type: "compacted";
+  payload: {
+    message: string;
+    replacement_history: unknown[];
+    [key: string]: unknown;
+  };
+}
+
+export interface CodexInterAgentMetadataRecord extends CodexRecordBase {
+  type: "inter_agent_communication_metadata";
+  payload: { trigger_turn: boolean; [key: string]: unknown };
+}
+
+export interface CodexLegacyResponseRecord extends CodexRecordBase {
+  type: "function_call" | "function_call_output" | "reasoning" | "message";
+  [key: string]: unknown;
+}
+
 export type CodexRecord =
   | CodexSessionMetaRecord
   | CodexResponseItemRecord
   | CodexEventMsgRecord
-  | CodexTurnContextRecord;
+  | CodexTurnContextRecord
+  | CodexWorldStateRecord
+  | CodexCompactedRecord
+  | CodexInterAgentMetadataRecord
+  | CodexLegacyResponseRecord;
+
+export interface CodexConversationToolCall {
+  kind: "function" | "custom" | "web_search" | "tool_search";
+  name: string;
+  arguments: Record<string, unknown>;
+  callId: string;
+  output: string;
+  rawOutput?: unknown;
+  namespace?: string;
+  status?: string;
+}
 
 export interface CodexConversationTurn {
   turnNumber: number;
   context: CodexTurnContextPayload;
+  timestamp?: ISO8601Timestamp;
   userMessage: string;
+  userImages: string[];
   reasoning?: string;
   reasoningSummary?: string;
-  toolCalls: Array<{
-    name: string;
-    arguments: Record<string, unknown>;
-    callId: string;
-    output: string;
-  }>;
+  toolCalls: CodexConversationToolCall[];
+  agentMessages: Array<{ author: string; recipient: string; text: string }>;
   assistantMessage: string;
   tokenUsage?: CodexTokenCountEvent["rate_limits"];
 }
@@ -298,6 +535,11 @@ export interface CodexSession {
   metadata: CodexSessionMetaPayload;
   records: CodexRecord[];
   turns: CodexConversationTurn[];
+  recordCounts?: Record<string, number>;
+  responseItemCounts?: Record<string, number>;
+  eventCounts?: Record<string, number>;
+  compactions?: CodexCompactedRecord["payload"][];
+  developerMessages?: Array<{ text: string; timestamp?: ISO8601Timestamp }>;
   totalRecords: {
     session_meta: number;
     response_item: number;
@@ -316,6 +558,7 @@ export interface ClaudeToCodexOptions {
   modelProvider?: string;
   cliVersion?: string;
   outputDir?: string;
+  targetCwd?: string;
 }
 
 export interface CodexToClaudeOptions {
@@ -324,6 +567,7 @@ export interface CodexToClaudeOptions {
   projectPath?: string;
   version?: string;
   outputDir?: string;
+  targetCwd?: string;
 }
 
 export interface ConversionResult<T> {
@@ -398,10 +642,494 @@ function mapCodexToolToClaude(codexTool: string): string {
 }
 
 function mapCodexModelToClaude(codexModel: string): string {
-  if (codexModel.includes("gpt") || codexModel.includes("codex")) {
-    return "claude-sonnet-4-5-20250929";
+  if (
+    codexModel.includes("gpt") ||
+    codexModel.includes("codex") ||
+    codexModel.includes("gemini")
+  ) {
+    return process.env.AGENT_CLAUDE_MODEL || "claude-opus-5";
   }
   return codexModel;
+}
+
+function recordCounts(records: Array<{ type?: string }>): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const record of records) {
+    const type = record.type || "unknown";
+    counts[type] = (counts[type] || 0) + 1;
+  }
+  return counts;
+}
+
+function normalizeClaudeTimestamps(records: ClaudeRecord[]): ClaudeRecord[] {
+  let lastTimestampMs = 0;
+
+  return records.map((record) => {
+    if (!("timestamp" in record) || typeof record.timestamp !== "string") {
+      return record;
+    }
+
+    const parsed = new Date(record.timestamp).getTime();
+    const timestamp = Math.max(
+      Number.isNaN(parsed) ? Date.now() : parsed,
+      lastTimestampMs + 1
+    );
+    lastTimestampMs = timestamp;
+
+    if (timestamp === parsed) return record;
+    return { ...record, timestamp: new Date(timestamp).toISOString() } as ClaudeRecord;
+  });
+}
+
+function parseToolArguments(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string") return { value };
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : { value: parsed };
+  } catch {
+    return { raw: value };
+  }
+}
+
+function stringifyPortableContent(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (!item || typeof item !== "object") return String(item ?? "");
+        const block = item as Record<string, unknown>;
+        if (typeof block.text === "string") return block.text;
+        if (typeof block.image_url === "string") {
+          const url = block.image_url;
+          const label = url.startsWith("data:")
+            ? url.slice(0, url.indexOf(",") + 1) + "<base64>"
+            : url;
+          return `[Image: ${label}]`;
+        }
+        return JSON.stringify(block);
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return JSON.stringify(value);
+}
+
+function claudeText(content: string | ClaudeContentBlock[]): string {
+  if (typeof content === "string") return content;
+  return content
+    .map((block) => {
+      if (block.type === "text") return block.text;
+      if (block.type === "fallback") {
+        return `Model fallback: ${block.from} -> ${block.to}`;
+      }
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function codexText(content: CodexMessageContent[] | unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter(
+      (block): block is CodexTextContent =>
+        !!block && typeof block === "object" && typeof block.text === "string"
+    )
+    .map((block) => block.text)
+    .join("\n");
+}
+
+function codexImages(content: CodexMessageContent[] | unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter(
+      (block): block is CodexImageContent =>
+        !!block &&
+        typeof block === "object" &&
+        block.type === "input_image" &&
+        typeof block.image_url === "string"
+    )
+    .map((block) => block.image_url);
+}
+
+function codexImageToClaude(imageUrl: string): ClaudeImageBlock {
+  const match = imageUrl.match(/^data:([^;,]+);base64,(.*)$/s);
+  if (match) {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: match[1],
+        data: match[2],
+      },
+    };
+  }
+  return { type: "image", source: { type: "url", url: imageUrl } };
+}
+
+function codexToolOutputToClaude(value: unknown): unknown {
+  if (!Array.isArray(value)) return stringifyPortableContent(value);
+  return value.map((item) => {
+    if (!item || typeof item !== "object") {
+      return { type: "text", text: String(item ?? "") };
+    }
+    const block = item as Record<string, unknown>;
+    if (typeof block.text === "string") {
+      return { type: "text", text: block.text };
+    }
+    if (block.type === "input_image" && typeof block.image_url === "string") {
+      return codexImageToClaude(block.image_url);
+    }
+    return { type: "text", text: JSON.stringify(block) };
+  });
+}
+
+function claudeMediaToCodex(
+  content: string | ClaudeContentBlock[]
+): CodexImageContent[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((block) => {
+    if (block.type !== "image") return [];
+    if (block.source.type === "base64" && block.source.data) {
+      return [
+        {
+          type: "input_image" as const,
+          image_url: `data:${block.source.media_type || "image/png"};base64,${block.source.data}`,
+          detail: "auto",
+        },
+      ];
+    }
+    if (block.source.url) {
+      return [
+        {
+          type: "input_image" as const,
+          image_url: block.source.url,
+          detail: "auto",
+        },
+      ];
+    }
+    return [];
+  });
+}
+
+function claudeToolOutput(content: unknown): unknown {
+  if (!Array.isArray(content)) return stringifyPortableContent(content);
+  return content.map((item) => {
+    if (!item || typeof item !== "object") {
+      return { type: "input_text", text: String(item ?? "") };
+    }
+    const block = item as Record<string, unknown>;
+    if (block.type === "text" && typeof block.text === "string") {
+      return { type: "input_text", text: block.text };
+    }
+    if (block.type === "image" && block.source && typeof block.source === "object") {
+      const source = block.source as Record<string, unknown>;
+      if (source.type === "base64" && typeof source.data === "string") {
+        return {
+          type: "input_image",
+          image_url: `data:${typeof source.media_type === "string" ? source.media_type : "image/png"};base64,${source.data}`,
+          detail: "auto",
+        };
+      }
+    }
+    return { type: "input_text", text: JSON.stringify(block) };
+  });
+}
+
+export function applyClaudeTargetCwd(
+  session: ClaudeSession,
+  targetCwd: string
+): ClaudeSession {
+  const projectPath = targetCwd;
+
+  const remappedRecords = session.records.map((record) => {
+    if ("cwd" in record) {
+      return {
+        ...record,
+        cwd: targetCwd,
+      } as ClaudeRecord;
+    }
+
+    return record;
+  });
+
+  const remappedMessages = remappedRecords.filter(
+    (record): record is ClaudeUserRecord | ClaudeAssistantRecord =>
+      record.type === "user" || record.type === "assistant"
+  );
+
+  return {
+    ...session,
+    projectPath,
+    records: remappedRecords,
+    messages: remappedMessages,
+    metadata: {
+      ...session.metadata,
+      cwd: targetCwd,
+    },
+  };
+}
+
+export async function writeClaudeSession(
+  session: ClaudeSession,
+  options: Pick<CodexToClaudeOptions, "outputDir" | "targetCwd">
+): Promise<string> {
+  const finalSession = options.targetCwd
+    ? applyClaudeTargetCwd(session, options.targetCwd)
+    : session;
+  finalSession.records = normalizeClaudeTimestamps(finalSession.records);
+  finalSession.messages = finalSession.records.filter(
+    (record): record is ClaudeUserRecord | ClaudeAssistantRecord =>
+      record.type === "user" || record.type === "assistant"
+  );
+  finalSession.recordCounts = recordCounts(finalSession.records);
+
+  const homeDir = process.env.HOME || Bun.env.HOME || "/tmp";
+  const finalOutputDir = options.outputDir || join(homeDir, ".claude", "projects");
+  const projectPath = finalSession.projectPath || finalSession.metadata.cwd || "/tmp/converted-sessions";
+  const encodedProjectPath = slugifyClaudeProjectPath(projectPath);
+  const projectDir = join(finalOutputDir, encodedProjectPath);
+
+  await mkdir(projectDir, { recursive: true });
+
+  const outputPath = join(projectDir, `${finalSession.sessionId}.jsonl`);
+  const content =
+    finalSession.records.map((record) => JSON.stringify(record)).join("\n") + "\n";
+  await Bun.write(outputPath, content);
+
+  finalSession.filePath = outputPath;
+  session.filePath = outputPath;
+  session.projectPath = finalSession.projectPath;
+  session.records = finalSession.records;
+  session.messages = finalSession.messages;
+  session.metadata = finalSession.metadata;
+
+  return outputPath;
+}
+
+export function buildClaudeSessionFromCodex(
+  codexSession: CodexSession,
+  options: Omit<CodexToClaudeOptions, "outputDir"> = {}
+): ClaudeSession {
+  const {
+    generateUuids = true,
+    reconstructThreading = true,
+    projectPath,
+    version = process.env.AGENT_CLAUDE_VERSION || "2.1.170",
+    targetCwd,
+  } = options;
+
+  const finalCwd =
+    targetCwd || projectPath || codexSession.metadata.cwd || "/tmp/converted-sessions";
+  const sessionId = generateUuids ? crypto.randomUUID() : codexSession.id;
+  let parentUuid: string | null = null;
+
+  const records: ClaudeRecord[] = [];
+  const messages: (ClaudeUserRecord | ClaudeAssistantRecord)[] = [];
+  let lastTimestampMs = 0;
+  const nextTimestamp = (candidate?: string) => {
+    const parsed = candidate ? new Date(candidate).getTime() : Date.now();
+    const timestamp = Math.max(
+      Number.isNaN(parsed) ? Date.now() : parsed,
+      lastTimestampMs + 1
+    );
+    lastTimestampMs = timestamp;
+    return new Date(timestamp).toISOString();
+  };
+
+  const addSystemRecord = (text: string, timestamp?: string) => {
+    const uuid = crypto.randomUUID();
+    const record: ClaudeSystemRecord = {
+      type: "system",
+      subtype: "informational",
+      content: text,
+      isMeta: true,
+      level: "info",
+      entrypoint: "cli",
+      sessionId,
+      timestamp: nextTimestamp(timestamp),
+      uuid,
+      parentUuid: reconstructThreading ? parentUuid : null,
+      isSidechain: false,
+      userType: "external",
+      cwd: finalCwd,
+      version,
+      gitBranch: codexSession.metadata.git?.branch || "",
+    };
+    records.push(record);
+    if (reconstructThreading) parentUuid = uuid;
+  };
+
+  for (const developerMessage of codexSession.developerMessages || []) {
+    addSystemRecord(
+      `[Imported Codex developer message]\n${developerMessage.text}`,
+      developerMessage.timestamp
+    );
+  }
+  for (const compaction of codexSession.compactions || []) {
+    addSystemRecord(`[Imported Codex compaction]\n${compaction.message}`);
+  }
+
+  for (const turn of codexSession.turns) {
+    const userUuid = generateUuids ? crypto.randomUUID() : `user-${turn.turnNumber}`;
+    const assistantUuid = generateUuids
+      ? crypto.randomUUID()
+      : `assistant-${turn.turnNumber}`;
+
+    const userContent: ClaudeContentBlock[] = [];
+    if (turn.userMessage) {
+      userContent.push({ type: "text", text: turn.userMessage });
+    }
+    userContent.push(...turn.userImages.map(codexImageToClaude));
+    const userTimestamp = nextTimestamp(turn.timestamp);
+
+    const userRecord: ClaudeUserRecord = {
+      type: "user",
+      sessionId,
+      timestamp: userTimestamp,
+      uuid: userUuid,
+      parentUuid: reconstructThreading ? parentUuid : null,
+      isSidechain: false,
+      userType: "external",
+      cwd: finalCwd,
+      version,
+      gitBranch: codexSession.metadata.git?.branch || "",
+      message: {
+        role: "user",
+        content: userContent,
+      },
+    };
+
+    records.push(userRecord);
+    messages.push(userRecord);
+
+    const assistantContent: ClaudeContentBlock[] = [];
+
+    if (turn.reasoning || turn.reasoningSummary) {
+      assistantContent.push({
+        type: "text",
+        text: `[Imported reasoning]\n${turn.reasoning || turn.reasoningSummary || ""}`,
+      });
+    }
+
+    for (const toolCall of turn.toolCalls) {
+      assistantContent.push({
+        type: "tool_use",
+        id: `toolu_${toolCall.callId.replace("call_", "")}`,
+        name: mapCodexToolToClaude(toolCall.name),
+        input: toolCall.arguments,
+      });
+    }
+
+    for (const agentMessage of turn.agentMessages) {
+      assistantContent.push({
+        type: "text",
+        text: `[Agent ${agentMessage.author} -> ${agentMessage.recipient}]\n${agentMessage.text}`,
+      });
+    }
+
+    if (turn.assistantMessage) {
+      assistantContent.push({
+        type: "text",
+        text: turn.assistantMessage,
+      });
+    }
+
+    if (assistantContent.length === 0) {
+      parentUuid = userUuid;
+      continue;
+    }
+
+    const assistantTimestamp = nextTimestamp(turn.timestamp);
+
+    const assistantRecord: ClaudeAssistantRecord = {
+      type: "assistant",
+      sessionId,
+      timestamp: assistantTimestamp,
+      uuid: assistantUuid,
+      parentUuid: reconstructThreading ? userUuid : null,
+      isSidechain: false,
+      userType: "external",
+      cwd: finalCwd,
+      version,
+      gitBranch: codexSession.metadata.git?.branch || "",
+      message: {
+        role: "assistant",
+        model: mapCodexModelToClaude(turn.context?.model || "gpt-5.2-codex"),
+        id: `msg_${assistantUuid.substring(0, 10)}`,
+        type: "message",
+        content: assistantContent,
+        stop_reason: turn.toolCalls.length > 0 ? "tool_use" : "end_turn",
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+        },
+      },
+    };
+
+    records.push(assistantRecord);
+    messages.push(assistantRecord);
+
+    if (turn.toolCalls.length > 0) {
+      const toolResultUuid = generateUuids
+        ? crypto.randomUUID()
+        : `tool-result-${turn.turnNumber}`;
+
+      const toolResultRecord: ClaudeUserRecord = {
+        type: "user",
+        sessionId,
+        timestamp: nextTimestamp(turn.timestamp),
+        uuid: toolResultUuid,
+        parentUuid: reconstructThreading ? assistantUuid : null,
+        isSidechain: false,
+        userType: "internal",
+        cwd: finalCwd,
+        version,
+        gitBranch: codexSession.metadata.git?.branch || "",
+        message: {
+          role: "user",
+          content: turn.toolCalls.map((call) => ({
+            type: "tool_result" as const,
+            tool_use_id: `toolu_${call.callId.replace("call_", "")}`,
+            content: codexToolOutputToClaude(call.rawOutput ?? call.output),
+          })),
+        },
+      };
+
+      records.push(toolResultRecord);
+      messages.push(toolResultRecord);
+      parentUuid = toolResultUuid;
+    } else {
+      parentUuid = assistantUuid;
+    }
+  }
+
+  return {
+    sessionId,
+    projectPath: finalCwd,
+    filePath: "",
+    records,
+    messages,
+    summary: undefined,
+    fileSnapshots: [],
+    recordCounts: recordCounts(records),
+    metadata: {
+      version,
+      cwd: finalCwd,
+      gitBranch: codexSession.metadata.git?.branch || "",
+      totalTokens: {
+        input: 0,
+        output: 0,
+      },
+    },
+  };
 }
 
 // ============================================================================
@@ -462,7 +1190,8 @@ export async function parseClaudeSession(filePath: string): Promise<ClaudeSessio
   }
 
   const projectDir = basename(dirname(filePath));
-  const projectPath = projectDir.replace(/^-/, "/").replace(/-/g, "/");
+  const fallbackProjectPath = projectDir.replace(/^-/, "/").replace(/-/g, "/");
+  const projectPath = firstMessage?.cwd || fallbackProjectPath;
 
   return {
     sessionId,
@@ -472,6 +1201,7 @@ export async function parseClaudeSession(filePath: string): Promise<ClaudeSessio
     messages,
     summary,
     fileSnapshots,
+    recordCounts: recordCounts(records),
     metadata: {
       version: firstMessage?.version || "unknown",
       cwd: firstMessage?.cwd || "",
@@ -482,6 +1212,28 @@ export async function parseClaudeSession(filePath: string): Promise<ClaudeSessio
       },
     },
   };
+}
+
+async function readClaudeSessionCwd(filePath: string): Promise<string | undefined> {
+  const input = createReadStream(filePath, { encoding: "utf8" });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const record = JSON.parse(line) as { cwd?: unknown };
+        if (typeof record.cwd === "string" && record.cwd) return record.cwd;
+      } catch {
+        // Skip malformed records.
+      }
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+
+  return undefined;
 }
 
 /**
@@ -500,13 +1252,8 @@ export async function listClaudeSessions(
     const projectDirs = await readdir(projectsDir);
 
     for (const dir of projectDirs) {
-      const decodedPath = "/" + dir.replace(/^-/, "").replace(/-/g, "/");
-
-      if (projectPath && !decodedPath.includes(projectPath)) {
-        continue;
-      }
-
       const projectDir = join(projectsDir, dir);
+      const fallbackProjectPath = "/" + dir.replace(/^-/, "").replace(/-/g, "/");
 
       try {
         const files = await readdir(projectDir);
@@ -514,6 +1261,13 @@ export async function listClaudeSessions(
 
         for (const file of jsonlFiles) {
           const filePath = join(projectDir, file);
+          const storedProjectPath =
+            (await readClaudeSessionCwd(filePath)) || fallbackProjectPath;
+
+          if (projectPath && !storedProjectPath.includes(projectPath)) {
+            continue;
+          }
+
           const sessionId = basename(file, ".jsonl");
           const stat = await Bun.file(filePath).stat();
 
@@ -522,7 +1276,7 @@ export async function listClaudeSessions(
             format: "claude",
             sessionId,
             timestamp: stat?.mtime?.toISOString() || new Date().toISOString(),
-            project: decodedPath,
+            project: storedProjectPath,
           });
         }
       } catch {
@@ -568,100 +1322,494 @@ export async function parseCodexFile(filePath: string): Promise<CodexRecord[]> {
 /**
  * Extract conversation turns from Codex records
  */
-function extractCodexTurns(records: CodexRecord[]): CodexConversationTurn[] {
+function extractCodexTurns(
+  records: CodexRecord[],
+  metadata: CodexSessionMetaPayload
+): CodexConversationTurn[] {
   const turns: CodexConversationTurn[] = [];
   let currentTurn: Partial<CodexConversationTurn> | null = null;
   let turnNumber = 0;
 
-  const pendingToolCalls = new Map<
-    string,
-    { name: string; arguments: Record<string, unknown>; callId: string }
-  >();
+  let lastContext: CodexTurnContextPayload = {
+    cwd: metadata.cwd,
+    model: "",
+  };
+  const responseItemIds = new Set(
+    records.flatMap((record) => {
+      if (record.type !== "response_item") return [];
+      const id = (record.payload as Record<string, unknown>).id;
+      return typeof id === "string" ? [id] : [];
+    })
+  );
+  let generatedCallId = 0;
+  const pendingToolCalls = new Map<string, CodexConversationToolCall>();
+
+  const startTurn = (timestamp?: string) => {
+    turnNumber++;
+    currentTurn = {
+      turnNumber,
+      context: lastContext,
+      timestamp,
+      userMessage: "",
+      userImages: [],
+      toolCalls: [],
+      agentMessages: [],
+      assistantMessage: "",
+    };
+    return currentTurn;
+  };
+
+  const ensureTurn = (timestamp?: string) => currentTurn || startTurn(timestamp);
+
+  const finishTurn = () => {
+    if (
+      currentTurn &&
+      (currentTurn.userMessage ||
+        currentTurn.assistantMessage ||
+        currentTurn.reasoning ||
+        currentTurn.reasoningSummary ||
+        currentTurn.toolCalls?.length ||
+        currentTurn.agentMessages?.length)
+    ) {
+      turns.push(currentTurn as CodexConversationTurn);
+    } else if (currentTurn) {
+      turnNumber--;
+    }
+    currentTurn = null;
+  };
+
+  const appendText = (
+    field: "assistantMessage" | "reasoning" | "reasoningSummary",
+    text: string,
+    timestamp?: string
+  ) => {
+    if (!text) return;
+    const turn = ensureTurn(timestamp);
+    const existing = turn[field] || "";
+    if (existing === text || existing.split("\n").includes(text)) return;
+    turn[field] = existing ? `${existing}\n${text}` : text;
+  };
+
+  const setUserMessage = (text: string, images: string[], timestamp?: string) => {
+    let turn = ensureTurn(timestamp);
+    if (
+      text &&
+      turn.userMessage &&
+      turn.userMessage !== text &&
+      (turn.assistantMessage || turn.reasoning || turn.toolCalls?.length)
+    ) {
+      finishTurn();
+      turn = ensureTurn(timestamp);
+    }
+    if (text && !turn.userMessage) turn.userMessage = text;
+    const existingImages = new Set(turn.userImages || []);
+    for (const image of images) existingImages.add(image);
+    turn.userImages = [...existingImages];
+  };
+
+  const addToolCall = (
+    kind: CodexConversationToolCall["kind"],
+    payload: Record<string, unknown>,
+    timestamp?: string
+  ) => {
+    const callId =
+      (typeof payload.call_id === "string" && payload.call_id) ||
+      (typeof payload.id === "string" && payload.id) ||
+      `generated_call_${++generatedCallId}`;
+    const name =
+        typeof payload.name === "string"
+          ? payload.name
+          : kind === "web_search"
+            ? "web_search"
+            : kind === "tool_search"
+              ? "tool_search"
+              : "unknown_tool";
+    const argumentsValue = parseToolArguments(
+      payload.arguments ?? payload.input ?? payload.action ?? {}
+    );
+    const existing = pendingToolCalls.get(callId);
+    if (existing) {
+      existing.kind = kind;
+      existing.name = name;
+      existing.arguments = argumentsValue;
+      if (typeof payload.namespace === "string") existing.namespace = payload.namespace;
+      if (typeof payload.status === "string") existing.status = payload.status;
+      return existing;
+    }
+    const call: CodexConversationToolCall = {
+      kind,
+      name,
+      arguments: argumentsValue,
+      callId,
+      output:
+        kind === "web_search" && payload.status
+          ? stringifyPortableContent({ status: payload.status })
+          : "",
+      ...(typeof payload.namespace === "string"
+        ? { namespace: payload.namespace }
+        : {}),
+      ...(typeof payload.status === "string" ? { status: payload.status } : {}),
+    };
+    ensureTurn(timestamp).toolCalls!.push(call);
+    pendingToolCalls.set(callId, call);
+    return call;
+  };
+
+  const applyToolOutput = (
+    callId: unknown,
+    output: unknown,
+    fallbackName?: string,
+    timestamp?: string
+  ) => {
+    if (typeof callId !== "string") return;
+    let call = pendingToolCalls.get(callId);
+    if (!call) {
+      call = {
+        kind: "custom",
+        name: fallbackName || "tool_result",
+        arguments: {},
+        callId,
+        output: "",
+      };
+      ensureTurn(timestamp).toolCalls!.push(call);
+      pendingToolCalls.set(callId, call);
+    }
+    call.rawOutput = output;
+    call.output = stringifyPortableContent(output);
+  };
+
+  const unresolvedCurrentTool = (names: string[]) =>
+    [...(currentTurn?.toolCalls || [])]
+      .reverse()
+      .find(
+        (call) =>
+          names.includes(call.name) && typeof call.rawOutput === "undefined"
+      );
 
   for (const record of records) {
     if (record.type === "turn_context") {
-      if (currentTurn && currentTurn.userMessage) {
-        turns.push(currentTurn as CodexConversationTurn);
-      }
-
-      turnNumber++;
-      currentTurn = {
-        turnNumber,
-        context: (record as CodexTurnContextRecord).payload,
-        userMessage: "",
-        toolCalls: [],
-        assistantMessage: "",
-      };
-      pendingToolCalls.clear();
+      finishTurn();
+      lastContext = (record as CodexTurnContextRecord).payload;
+      startTurn(record.timestamp);
+      continue;
     }
 
     if (record.type === "event_msg") {
       const eventRecord = record as CodexEventMsgRecord;
+      const payload = eventRecord.payload as Record<string, unknown>;
 
-      if (eventRecord.payload.type === "user_message" && currentTurn) {
-        currentTurn.userMessage = eventRecord.payload.message;
+      if (payload.type === "user_message") {
+        const images = [payload.images, payload.local_images]
+          .flatMap((value) => (Array.isArray(value) ? value : []))
+          .filter((value): value is string => typeof value === "string");
+        setUserMessage(
+          typeof payload.message === "string" ? payload.message : "",
+          images,
+          record.timestamp
+        );
       }
 
-      if (eventRecord.payload.type === "agent_reasoning" && currentTurn) {
-        currentTurn.reasoning = eventRecord.payload.text;
+      if (payload.type === "agent_reasoning" && typeof payload.text === "string") {
+        appendText("reasoning", payload.text, record.timestamp);
       }
 
-      if (eventRecord.payload.type === "agent_message" && currentTurn) {
-        currentTurn.assistantMessage = eventRecord.payload.message;
+      if (payload.type === "agent_message" && typeof payload.message === "string") {
+        appendText("assistantMessage", payload.message, record.timestamp);
       }
 
-      if (eventRecord.payload.type === "token_count" && currentTurn) {
-        currentTurn.tokenUsage = eventRecord.payload.rate_limits;
+      if (payload.type === "token_count") {
+        const turn = ensureTurn(record.timestamp);
+        if (payload.rate_limits && typeof payload.rate_limits === "object") {
+          turn.tokenUsage = payload.rate_limits as CodexTokenCountEvent["rate_limits"];
+        }
+      }
+
+      if (payload.type === "web_search_end") {
+        applyToolOutput(
+          payload.call_id,
+          payload.results ?? payload.action ?? payload.query,
+          "web_search",
+          record.timestamp
+        );
+      }
+
+      if (payload.type === "dynamic_tool_call_request") {
+        addToolCall(
+          "custom",
+          {
+            call_id: payload.callId,
+            name: payload.tool,
+            arguments: payload.arguments,
+            namespace: payload.namespace,
+          },
+          record.timestamp
+        );
+      }
+
+      if (payload.type === "dynamic_tool_call_response") {
+        applyToolOutput(
+          payload.call_id,
+          payload.content_items ?? payload.error,
+          typeof payload.tool === "string" ? payload.tool : undefined,
+          record.timestamp
+        );
+      }
+
+      if (payload.type === "exec_command_end") {
+        applyToolOutput(
+          payload.call_id,
+          payload.formatted_output ?? payload.aggregated_output ?? {
+            stdout: payload.stdout,
+            stderr: payload.stderr,
+            exit_code: payload.exit_code,
+          },
+          "exec_command",
+          record.timestamp
+        );
+      }
+
+      if (payload.type === "patch_apply_end") {
+        applyToolOutput(
+          payload.call_id,
+          {
+            stdout: payload.stdout,
+            stderr: payload.stderr,
+            success: payload.success,
+            changes: payload.changes,
+          },
+          "apply_patch",
+          record.timestamp
+        );
+      }
+
+      if (payload.type === "mcp_tool_call_end") {
+        applyToolOutput(
+          payload.call_id,
+          payload.result,
+          "mcp_tool_call",
+          record.timestamp
+        );
+      }
+
+      if (payload.type === "image_generation_end") {
+        applyToolOutput(
+          payload.call_id,
+          payload.result ?? payload.saved_path,
+          "image_generation",
+          record.timestamp
+        );
+      }
+
+      if (payload.type === "item_completed" && payload.item && typeof payload.item === "object") {
+        const item = payload.item as Record<string, unknown>;
+        const itemId = typeof item.id === "string" ? item.id : "";
+        if (itemId && !responseItemIds.has(itemId)) {
+          if (item.type === "UserMessage") {
+            setUserMessage(
+              stringifyPortableContent(item.content),
+              [],
+              record.timestamp
+            );
+          } else if (item.type === "AgentMessage") {
+            appendText(
+              "assistantMessage",
+              stringifyPortableContent(item.content),
+              record.timestamp
+            );
+          } else if (item.type === "Reasoning") {
+            appendText(
+              "reasoningSummary",
+              stringifyPortableContent(item.summary_text ?? item.raw_content),
+              record.timestamp
+            );
+          } else if (item.type === "CommandExecution") {
+            const existing = unresolvedCurrentTool([
+              "exec",
+              "exec_command",
+              "shell_command",
+            ]);
+            const callId = existing?.callId || itemId;
+            if (existing && typeof item.status === "string") {
+              existing.status = item.status;
+            } else if (!existing) {
+              addToolCall(
+                "custom",
+                {
+                  call_id: callId,
+                  name: "exec_command",
+                  arguments: { command: item.command, cwd: item.cwd },
+                  status: item.status,
+                },
+                record.timestamp
+              );
+            }
+            applyToolOutput(
+              callId,
+              item.formatted_output ?? item.aggregated_output,
+              "exec_command",
+              record.timestamp
+            );
+          } else if (item.type === "FileChange") {
+            const existing = unresolvedCurrentTool(["apply_patch"]);
+            const callId = existing?.callId || itemId;
+            if (existing && typeof item.status === "string") {
+              existing.status = item.status;
+            } else if (!existing) {
+              addToolCall(
+                "custom",
+                {
+                  call_id: callId,
+                  name: "apply_patch",
+                  arguments: { changes: item.changes },
+                  status: item.status,
+                },
+                record.timestamp
+              );
+            }
+            applyToolOutput(
+              callId,
+              { stdout: item.stdout, stderr: item.stderr },
+              "apply_patch",
+              record.timestamp
+            );
+          } else if (item.type === "ImageView") {
+            const existing = unresolvedCurrentTool(["view_image"]);
+            if (existing) {
+              existing.status = "completed";
+            } else {
+              addToolCall(
+                "custom",
+                {
+                  call_id: itemId,
+                  name: "view_image",
+                  arguments: { path: item.path },
+                  status: "completed",
+                },
+                record.timestamp
+              );
+            }
+          }
+        }
       }
     }
 
-    if (record.type === "response_item") {
-      const responseRecord = record as CodexResponseItemRecord;
-      const payload = responseRecord.payload;
+    const isLegacyResponse = [
+      "function_call",
+      "function_call_output",
+      "reasoning",
+      "message",
+    ].includes(record.type);
 
-      if (payload.type === "reasoning") {
+    if (record.type === "response_item" || isLegacyResponse) {
+      const payload = (record.type === "response_item"
+        ? (record as CodexResponseItemRecord).payload
+        : record) as CodexResponseItemPayload;
+      const payloadType =
+        payload.type ||
+        ("role" in payload && "content" in payload ? "message" : undefined);
+
+      if (payloadType === "message") {
+        const messagePayload = payload as CodexMessagePayload;
+        const text = codexText(messagePayload.content);
+        const images = codexImages(messagePayload.content);
+
+        if (messagePayload.role === "user") {
+          setUserMessage(text, images, record.timestamp);
+        }
+
+        if (messagePayload.role === "assistant") {
+          appendText("assistantMessage", text, record.timestamp);
+        }
+      }
+
+      if (payloadType === "reasoning") {
         const reasoningPayload = payload as CodexReasoningPayload;
-        if (currentTurn && reasoningPayload.summary?.[0]?.text) {
-          currentTurn.reasoningSummary = reasoningPayload.summary[0].text;
-        }
+        appendText(
+          "reasoningSummary",
+          Array.isArray(reasoningPayload.summary)
+            ? reasoningPayload.summary.map((item) => item.text).join("\n")
+            : "",
+          record.timestamp
+        );
       }
 
-      if (payload.type === "function_call") {
-        const callPayload = payload as CodexFunctionCallPayload;
-        try {
-          pendingToolCalls.set(callPayload.call_id, {
-            name: callPayload.name,
-            arguments: JSON.parse(callPayload.arguments),
-            callId: callPayload.call_id,
-          });
-        } catch {
-          pendingToolCalls.set(callPayload.call_id, {
-            name: callPayload.name,
-            arguments: { raw: callPayload.arguments },
-            callId: callPayload.call_id,
-          });
-        }
+      if (payloadType === "function_call") {
+        addToolCall(
+          "function",
+          payload as unknown as Record<string, unknown>,
+          record.timestamp
+        );
       }
 
-      if (payload.type === "function_call_output") {
+      if (payloadType === "function_call_output") {
         const outputPayload = payload as CodexFunctionCallOutputPayload;
-        const pendingCall = pendingToolCalls.get(outputPayload.call_id);
+        applyToolOutput(
+          outputPayload.call_id,
+          outputPayload.output,
+          undefined,
+          record.timestamp
+        );
+      }
 
-        if (pendingCall && currentTurn) {
-          currentTurn.toolCalls = currentTurn.toolCalls || [];
-          currentTurn.toolCalls.push({
-            ...pendingCall,
-            output: outputPayload.output,
+      if (payloadType === "custom_tool_call") {
+        addToolCall(
+          "custom",
+          payload as unknown as Record<string, unknown>,
+          record.timestamp
+        );
+      }
+
+      if (payloadType === "custom_tool_call_output") {
+        const outputPayload = payload as CodexCustomToolCallOutputPayload;
+        applyToolOutput(
+          outputPayload.call_id,
+          outputPayload.output,
+          outputPayload.name,
+          record.timestamp
+        );
+      }
+
+      if (payloadType === "web_search_call") {
+        addToolCall(
+          "web_search",
+          payload as unknown as Record<string, unknown>,
+          record.timestamp
+        );
+      }
+
+      if (payloadType === "tool_search_call") {
+        addToolCall(
+          "tool_search",
+          payload as unknown as Record<string, unknown>,
+          record.timestamp
+        );
+      }
+
+      if (payloadType === "tool_search_output") {
+        const outputPayload = payload as CodexToolSearchOutputPayload;
+        applyToolOutput(
+          outputPayload.call_id,
+          outputPayload.tools,
+          "tool_search",
+          record.timestamp
+        );
+      }
+
+      if (payloadType === "agent_message") {
+        const agentPayload = payload as CodexAgentMessagePayload;
+        const text = codexText(agentPayload.content);
+        if (text) {
+          ensureTurn(record.timestamp).agentMessages!.push({
+            author: agentPayload.author,
+            recipient: agentPayload.recipient,
+            text,
           });
-          pendingToolCalls.delete(outputPayload.call_id);
         }
       }
     }
   }
 
-  if (currentTurn && currentTurn.userMessage) {
-    turns.push(currentTurn as CodexConversationTurn);
-  }
+  finishTurn();
 
   return turns;
 }
@@ -687,7 +1835,38 @@ export async function parseCodexSession(filePath: string): Promise<CodexSession>
     turn_context: records.filter((r) => r.type === "turn_context").length,
   };
 
-  const turns = extractCodexTurns(records);
+  const counts = recordCounts(records);
+  const responseItemCounts: Record<string, number> = {};
+  const eventCounts: Record<string, number> = {};
+  const developerMessages: Array<{ text: string; timestamp?: string }> = [];
+  for (const record of records) {
+    if (record.type === "response_item") {
+      const payload = record.payload as CodexResponseItemPayload;
+      const type = payload.type ||
+        ("role" in payload && "content" in payload ? "message" : "unknown");
+      responseItemCounts[type] = (responseItemCounts[type] || 0) + 1;
+      if (type === "message") {
+        const message = payload as CodexMessagePayload;
+        if (message.role === "developer") {
+          const text = codexText(message.content);
+          if (text) developerMessages.push({ text, timestamp: record.timestamp });
+        }
+      }
+    } else if (record.type === "event_msg") {
+      const type = record.payload.type;
+      eventCounts[type] = (eventCounts[type] || 0) + 1;
+    } else if (["function_call", "function_call_output", "reasoning", "message"].includes(record.type)) {
+      responseItemCounts[record.type] = (responseItemCounts[record.type] || 0) + 1;
+      if (record.type === "message") {
+        const message = record as unknown as CodexMessagePayload;
+        if (message.role === "developer") {
+          const text = codexText(message.content);
+          if (text) developerMessages.push({ text, timestamp: record.timestamp });
+        }
+      }
+    }
+  }
+  const turns = extractCodexTurns(records, metaRecord.payload);
 
   return {
     id: metaRecord.payload.id,
@@ -695,6 +1874,13 @@ export async function parseCodexSession(filePath: string): Promise<CodexSession>
     metadata: metaRecord.payload,
     records,
     turns,
+    recordCounts: counts,
+    responseItemCounts,
+    eventCounts,
+    compactions: records
+      .filter((record): record is CodexCompactedRecord => record.type === "compacted")
+      .map((record) => record.payload),
+    developerMessages,
     totalRecords,
   };
 }
@@ -779,20 +1965,56 @@ export async function convertClaudeToCodex(
     preserveMetadata = true,
     model = "gpt-5.2-codex",
     modelProvider = "openai",
-    cliVersion = "0.80.0",
+    cliVersion = process.env.AGENT_CODEX_VERSION || "0.130.0",
     outputDir,
+    targetCwd,
   } = options;
 
   const homeDir = process.env.HOME || Bun.env.HOME || "/tmp";
   const finalOutputDir = outputDir || join(homeDir, ".codex", "sessions");
+  const effectiveCwd = targetCwd || claudeSession.metadata.cwd;
+  const effectiveSession = targetCwd
+    ? applyClaudeTargetCwd(claudeSession, targetCwd)
+    : claudeSession;
 
   const warnings: string[] = [];
   const errors: string[] = [];
   const records: CodexRecord[] = [];
 
+  const pushRecord = <T extends CodexRecord>(record: T): T => {
+    record.ordinal = records.length;
+    records.push(record);
+    return record;
+  };
+
+  const sourceCounts =
+    effectiveSession.recordCounts || recordCounts(effectiveSession.records);
+  const untranslatedMetadata = Object.entries(sourceCounts)
+    .filter(
+      ([type]) =>
+        ![
+          "user",
+          "assistant",
+          "summary",
+          "system",
+          "file-history-snapshot",
+        ].includes(type)
+    )
+    .map(([type, count]) => `${type}=${count}`)
+    .sort();
+  if (untranslatedMetadata.length > 0) {
+    warnings.push(
+      `Claude metadata retained in the source only: ${untranslatedMetadata.join(", ")}`
+    );
+  }
+
   const sessionId = generateUlid();
   const timestamp = new Date(
-    claudeSession.messages[0]?.timestamp || Date.now()
+    effectiveSession.messages[0]?.timestamp || Date.now()
+  );
+
+  warnings.push(
+    "Synthetic Claude-to-Codex conversion does not preserve the full client-authored Codex frame. Prefer cloning a real Codex session and seeding its task turn for resume-quality seeds."
   );
 
   // Create session_meta record
@@ -802,238 +2024,239 @@ export async function convertClaudeToCodex(
     payload: {
       id: sessionId,
       timestamp: timestamp.toISOString(),
-      cwd: claudeSession.metadata.cwd,
+      cwd: effectiveCwd,
       originator: "session-converter",
       cli_version: cliVersion,
       instructions: null,
       source: "converted",
       model_provider: modelProvider,
-      ...(claudeSession.metadata.gitBranch
+      ...(effectiveSession.metadata.gitBranch
         ? {
             git: {
               commit_hash: "",
-              branch: claudeSession.metadata.gitBranch,
+              branch: effectiveSession.metadata.gitBranch,
             },
           }
         : {}),
     },
   };
-  records.push(sessionMeta);
+  pushRecord(sessionMeta);
 
-  // Process messages in pairs (user -> assistant = one turn)
   let turnNumber = 0;
-  let i = 0;
-
-  while (i < claudeSession.messages.length) {
-    const userMsg = claudeSession.messages[i];
-
-    if (userMsg?.type !== "user") {
-      i++;
-      continue;
-    }
-
-    // Find the next assistant message
-    let assistantMsg: ClaudeAssistantRecord | null = null;
-    for (let j = i + 1; j < claudeSession.messages.length; j++) {
-      if (claudeSession.messages[j]!.type === "assistant") {
-        assistantMsg = claudeSession.messages[j] as ClaudeAssistantRecord;
-        i = j + 1;
-        break;
-      }
-    }
-
-    if (!assistantMsg) {
-      i++;
-      continue;
-    }
-
+  const callIdFor = (toolUseId: string) => {
+    const clean = toolUseId.replace(/^toolu_/, "").replace(/[^a-zA-Z0-9_-]/g, "_");
+    return clean.startsWith("call_") ? clean : `call_${clean}`;
+  };
+  const asDate = (value?: string) => {
+    const date = value ? new Date(value) : new Date();
+    return Number.isNaN(date.getTime()) ? new Date() : date;
+  };
+  const addTurnContext = (record: ClaudeUserRecord | ClaudeAssistantRecord) => {
+    const date = asDate(record.timestamp);
     turnNumber++;
-    const turnTimestamp = new Date(userMsg.timestamp);
-
-    // Create turn_context
-    const turnContext: CodexTurnContextRecord = {
-      timestamp: turnTimestamp.toISOString(),
+    pushRecord<CodexTurnContextRecord>({
+      timestamp: date.toISOString(),
       type: "turn_context",
       payload: {
-        cwd: userMsg.cwd,
+        cwd: record.cwd || effectiveCwd,
+        turn_id: crypto.randomUUID(),
+        current_date: getCurrentDateString(date),
+        timezone: getCurrentTimezone(),
         approval_policy: "never",
         sandbox_policy: { type: "danger-full-access" },
         model,
+        personality: "pragmatic",
+        collaboration_mode: {
+          mode: "default",
+          settings: {
+            model,
+            reasoning_effort: "high",
+            developer_instructions: null,
+          },
+        },
+        realtime_active: false,
         effort: "high",
         summary: "auto",
         user_instructions: "",
         truncation_policy: { mode: "tokens", limit: 10000 },
       },
-    };
-    records.push(turnContext);
+    });
+  };
 
-    // Extract user text (handle cases where content might not be an array)
-    const userContent = Array.isArray(userMsg.message?.content)
-      ? userMsg.message.content
+  let hasActiveTurn = false;
+  let toolCallsConverted = 0;
+
+  for (const sourceRecord of effectiveSession.records) {
+    if (sourceRecord.type === "summary") {
+      pushRecord<CodexResponseItemRecord>({
+        timestamp: timestamp.toISOString(),
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "developer",
+          content: [{ type: "input_text", text: `[Claude summary]\n${sourceRecord.summary}` }],
+        },
+      });
+      continue;
+    }
+
+    if (sourceRecord.type === "system") {
+      const content = sourceRecord.content;
+      if (typeof content === "string" && content.trim()) {
+        pushRecord<CodexResponseItemRecord>({
+          timestamp:
+            typeof sourceRecord.timestamp === "string"
+              ? asDate(sourceRecord.timestamp).toISOString()
+              : timestamp.toISOString(),
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "developer",
+            content: [
+              {
+                type: "input_text",
+                text: `[Claude system: ${String(sourceRecord.subtype || "informational")}]\n${content}`,
+              },
+            ],
+          },
+        });
+      }
+      continue;
+    }
+
+    if (sourceRecord.type === "user") {
+      const sourceContent = sourceRecord.message?.content ?? [];
+      const blocks = Array.isArray(sourceContent) ? sourceContent : [];
+      const toolResults = blocks.filter(
+        (block): block is ClaudeToolResultBlock => block.type === "tool_result"
+      );
+
+      for (const toolResult of toolResults) {
+        pushRecord<CodexResponseItemRecord>({
+          timestamp: asDate(sourceRecord.timestamp).toISOString(),
+          type: "response_item",
+          payload: {
+            type: "function_call_output",
+            call_id: callIdFor(toolResult.tool_use_id),
+            output: claudeToolOutput(toolResult.content),
+          },
+        });
+      }
+
+      const userText = claudeText(sourceContent);
+      const images = claudeMediaToCodex(sourceContent);
+      const hasExternalContent =
+        sourceRecord.userType !== "internal" && (userText || images.length > 0);
+      if (!hasExternalContent) continue;
+
+      addTurnContext(sourceRecord);
+      hasActiveTurn = true;
+      const userTimestamp = asDate(sourceRecord.timestamp).toISOString();
+      pushRecord<CodexEventMsgRecord>({
+        timestamp: userTimestamp,
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          message: userText,
+          images: images.map((image) => image.image_url),
+        },
+      });
+      pushRecord<CodexResponseItemRecord>({
+        timestamp: userTimestamp,
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "user",
+          content: [
+            ...(userText ? [{ type: "input_text" as const, text: userText }] : []),
+            ...images,
+          ],
+        },
+      });
+      continue;
+    }
+
+    if (sourceRecord.type !== "assistant") continue;
+    if (!hasActiveTurn) {
+      addTurnContext(sourceRecord);
+      hasActiveTurn = true;
+    }
+
+    const assistantTimestamp = asDate(sourceRecord.timestamp).toISOString();
+    const assistantContent = Array.isArray(sourceRecord.message?.content)
+      ? sourceRecord.message.content
       : [];
-    const userText = userContent
-      .filter((b): b is ClaudeTextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
-
-    // Create event_msg for user message
-    const userEvent: CodexEventMsgRecord = {
-      timestamp: turnTimestamp.toISOString(),
-      type: "event_msg",
-      payload: {
-        type: "user_message",
-        message: userText,
-        images: [],
-      },
-    };
-    records.push(userEvent);
-
-    // Create response_item for user message
-    const userResponse: CodexResponseItemRecord = {
-      timestamp: turnTimestamp.toISOString(),
-      type: "response_item",
-      payload: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: userText }],
-      },
-    };
-    records.push(userResponse);
-
-    // Process assistant content
-    const assistantTimestamp = new Date(assistantMsg.timestamp);
-
-    // Handle assistant content (protect against non-array content)
-    const assistantContent = Array.isArray(assistantMsg.message?.content)
-      ? assistantMsg.message.content
-      : [];
-
-    // Handle thinking blocks
     const thinkingBlocks = assistantContent.filter(
-      (b): b is ClaudeThinkingBlock => b.type === "thinking"
+      (block): block is ClaudeThinkingBlock => block.type === "thinking"
     );
-
     if (thinkingBlocks.length > 0) {
       warnings.push(
         `Turn ${turnNumber}: Thinking content stored as summary (encryption not supported)`
       );
-
-      const reasoningResponse: CodexResponseItemRecord = {
-        timestamp: assistantTimestamp.toISOString(),
+      pushRecord<CodexResponseItemRecord>({
+        timestamp: assistantTimestamp,
         type: "response_item",
         payload: {
           type: "reasoning",
           content: null,
           encrypted_content: "",
-          summary: thinkingBlocks.map((b) => ({
-            type: "summary_text" as const,
-            text: b.thinking.substring(0, 500) + "...",
+          summary: thinkingBlocks.map((block) => ({
+            type: "summary_text",
+            text: block.thinking,
           })),
         },
-      };
-      records.push(reasoningResponse);
-
-      const reasoningEvent: CodexEventMsgRecord = {
-        timestamp: assistantTimestamp.toISOString(),
+      });
+      pushRecord<CodexEventMsgRecord>({
+        timestamp: assistantTimestamp,
         type: "event_msg",
         payload: {
           type: "agent_reasoning",
-          text: thinkingBlocks[0]!.thinking.substring(0, 200),
+          text: thinkingBlocks.map((block) => block.thinking).join("\n"),
         },
-      };
-      records.push(reasoningEvent);
+      });
     }
 
-    // Handle tool uses
-    const toolUses = assistantContent.filter(
-      (b): b is ClaudeToolUseBlock => b.type === "tool_use"
-    );
-
-    // Find matching tool results
-    const toolResults = new Map<string, string>();
-    for (let k = i; k < claudeSession.messages.length; k++) {
-      const msg = claudeSession.messages[k];
-      if (msg?.type === "user") {
-        const msgContent = Array.isArray(msg.message?.content) ? msg.message.content : [];
-        for (const block of msgContent) {
-          if (block.type === "tool_result") {
-            const resultBlock = block as ClaudeToolResultBlock;
-            toolResults.set(
-              resultBlock.tool_use_id,
-              typeof resultBlock.content === "string"
-                ? resultBlock.content
-                : JSON.stringify(resultBlock.content)
-            );
-          }
-        }
-      }
-      if (msg?.type === "assistant") break;
-    }
-
-    for (const toolUse of toolUses) {
-      const callResponse: CodexResponseItemRecord = {
-        timestamp: assistantTimestamp.toISOString(),
+    for (const toolUse of assistantContent.filter(
+      (block): block is ClaudeToolUseBlock => block.type === "tool_use"
+    )) {
+      toolCallsConverted++;
+      pushRecord<CodexResponseItemRecord>({
+        timestamp: assistantTimestamp,
         type: "response_item",
         payload: {
           type: "function_call",
           name: mapClaudeToolToCodex(toolUse.name),
           arguments: JSON.stringify(toolUse.input),
-          call_id: `call_${toolUse.id.substring(0, 20)}`,
+          call_id: callIdFor(toolUse.id),
         },
-      };
-      records.push(callResponse);
-
-      const output = toolResults.get(toolUse.id) || "No output captured";
-      const outputResponse: CodexResponseItemRecord = {
-        timestamp: assistantTimestamp.toISOString(),
-        type: "response_item",
-        payload: {
-          type: "function_call_output",
-          call_id: `call_${toolUse.id.substring(0, 20)}`,
-          output,
-        },
-      };
-      records.push(outputResponse);
+      });
     }
 
-    // Handle text response
-    const textBlocks = assistantContent.filter(
-      (b): b is ClaudeTextBlock => b.type === "text"
-    );
-
-    const assistantText = textBlocks.map((b) => b.text).join("\n");
-
+    const assistantText = claudeText(assistantContent);
     if (assistantText) {
-      const assistantResponse: CodexResponseItemRecord = {
-        timestamp: assistantTimestamp.toISOString(),
+      pushRecord<CodexResponseItemRecord>({
+        timestamp: assistantTimestamp,
         type: "response_item",
         payload: {
           type: "message",
           role: "assistant",
           content: [{ type: "output_text", text: assistantText }],
         },
-      };
-      records.push(assistantResponse);
-
-      const assistantEvent: CodexEventMsgRecord = {
-        timestamp: assistantTimestamp.toISOString(),
+      });
+      pushRecord<CodexEventMsgRecord>({
+        timestamp: assistantTimestamp,
         type: "event_msg",
-        payload: {
-          type: "agent_message",
-          message: assistantText,
-        },
-      };
-      records.push(assistantEvent);
+        payload: { type: "agent_message", message: assistantText },
+      });
     }
 
-    // Add token count event
-    if (assistantMsg.message.usage) {
-      const tokenEvent: CodexEventMsgRecord = {
-        timestamp: assistantTimestamp.toISOString(),
+    if (sourceRecord.message.usage) {
+      pushRecord<CodexEventMsgRecord>({
+        timestamp: assistantTimestamp,
         type: "event_msg",
         payload: {
           type: "token_count",
-          info: preserveMetadata ? { claude_usage: assistantMsg.message.usage } : null,
+          info: preserveMetadata ? { claude_usage: sourceRecord.message.usage } : null,
           rate_limits: {
             primary: {
               used_percent: 0,
@@ -1053,8 +2276,7 @@ export async function convertClaudeToCodex(
             plan_type: null,
           },
         },
-      };
-      records.push(tokenEvent);
+      });
     }
   }
 
@@ -1081,7 +2303,9 @@ export async function convertClaudeToCodex(
     filePath: outputPath,
     metadata: sessionMeta.payload,
     records,
-    turns: [],
+    turns: extractCodexTurns(records, sessionMeta.payload),
+    recordCounts: recordCounts(records),
+    compactions: [],
     totalRecords: {
       session_meta: 1,
       response_item: records.filter((r) => r.type === "response_item").length,
@@ -1098,14 +2322,8 @@ export async function convertClaudeToCodex(
     errors,
     statistics: {
       recordsConverted: records.length,
-      messagesConverted: claudeSession.messages.length,
-      toolCallsConverted: claudeSession.messages.reduce((acc, m) => {
-        if (m.type === "assistant") {
-          const content = Array.isArray(m.message?.content) ? m.message.content : [];
-          return acc + content.filter((b) => b.type === "tool_use").length;
-        }
-        return acc;
-      }, 0),
+      messagesConverted: effectiveSession.messages.length,
+      toolCallsConverted,
       metadataPreserved: preserveMetadata,
     },
   };
@@ -1118,195 +2336,40 @@ export async function convertCodexToClaude(
   codexSession: CodexSession,
   options: CodexToClaudeOptions = {}
 ): Promise<ConversionResult<ClaudeSession>> {
-  const {
-    generateUuids = true,
-    reconstructThreading = true,
-    projectPath = "/tmp/converted-sessions",
-    version = "2.0.76",
-    outputDir,
-  } = options;
-
-  const homeDir = process.env.HOME || Bun.env.HOME || "/tmp";
-  const finalOutputDir = outputDir || join(homeDir, ".claude", "projects");
-
   const warnings: string[] = [];
   const errors: string[] = [];
-  const records: ClaudeRecord[] = [];
-  const messages: (ClaudeUserRecord | ClaudeAssistantRecord)[] = [];
+  const claudeSession = buildClaudeSessionFromCodex(codexSession, options);
+  const outputPath = await writeClaudeSession(claudeSession, options);
 
-  const sessionId = generateUuids ? crypto.randomUUID() : codexSession.id;
-  let parentUuid: string | null = null;
+  if (codexSession.developerMessages?.length) {
+    warnings.push(
+      `${codexSession.developerMessages.length} Codex developer message(s) were preserved as Claude system records.`
+    );
+  }
+  if (codexSession.compactions?.length) {
+    warnings.push(
+      `${codexSession.compactions.length} Codex compaction message(s) were preserved as Claude system records.`
+    );
+  }
 
-  // Process each turn
+  const sourceOnlyRecords = Object.entries(codexSession.recordCounts || {})
+    .filter(([type]) =>
+      ["world_state", "inter_agent_communication_metadata"].includes(type)
+    )
+    .map(([type, count]) => `${type}=${count}`);
+  if (sourceOnlyRecords.length > 0) {
+    warnings.push(
+      `Codex runtime metadata retained in the source only: ${sourceOnlyRecords.join(", ")}`
+    );
+  }
+
   for (const turn of codexSession.turns) {
-    const userUuid = generateUuids ? crypto.randomUUID() : `user-${turn.turnNumber}`;
-    const assistantUuid = generateUuids
-      ? crypto.randomUUID()
-      : `assistant-${turn.turnNumber}`;
-
-    // Create user record
-    const userContent: ClaudeTextBlock[] = [
-      {
-        type: "text",
-        text: turn.userMessage,
-      },
-    ];
-
-    const userRecord: ClaudeUserRecord = {
-      type: "user",
-      sessionId,
-      timestamp: new Date().toISOString(),
-      uuid: userUuid,
-      parentUuid: reconstructThreading ? parentUuid : null,
-      isSidechain: false,
-      userType: "external",
-      cwd: turn.context?.cwd || codexSession.metadata.cwd,
-      version,
-      gitBranch: codexSession.metadata.git?.branch || "",
-      message: {
-        role: "user",
-        content: userContent,
-      },
-    };
-
-    records.push(userRecord);
-    messages.push(userRecord);
-
-    // Create assistant record
-    const assistantContent: (
-      | ClaudeTextBlock
-      | ClaudeToolUseBlock
-      | ClaudeThinkingBlock
-    )[] = [];
-
-    // Add reasoning if available
     if (turn.reasoning || turn.reasoningSummary) {
       warnings.push(
         `Turn ${turn.turnNumber}: Using reasoning summary (full reasoning was encrypted in Codex)`
       );
-      assistantContent.push({
-        type: "thinking",
-        thinking: turn.reasoning || turn.reasoningSummary || "",
-      });
-    }
-
-    // Add tool uses
-    for (const toolCall of turn.toolCalls) {
-      assistantContent.push({
-        type: "tool_use",
-        id: `toolu_${toolCall.callId.replace("call_", "")}`,
-        name: mapCodexToolToClaude(toolCall.name),
-        input: toolCall.arguments,
-      });
-    }
-
-    // Add text response
-    if (turn.assistantMessage) {
-      assistantContent.push({
-        type: "text",
-        text: turn.assistantMessage,
-      });
-    }
-
-    const assistantRecord: ClaudeAssistantRecord = {
-      type: "assistant",
-      sessionId,
-      timestamp: new Date().toISOString(),
-      uuid: assistantUuid,
-      parentUuid: reconstructThreading ? userUuid : null,
-      isSidechain: false,
-      userType: "external",
-      cwd: turn.context?.cwd || codexSession.metadata.cwd,
-      version,
-      gitBranch: codexSession.metadata.git?.branch || "",
-      message: {
-        role: "assistant",
-        model: mapCodexModelToClaude(turn.context?.model || "gpt-5.2-codex"),
-        id: `msg_${assistantUuid.substring(0, 10)}`,
-        type: "message",
-        content: assistantContent,
-        stop_reason: turn.toolCalls.length > 0 ? "tool_use" : "end_turn",
-        stop_sequence: null,
-        usage: {
-          input_tokens: 0,
-          output_tokens: 0,
-        },
-      },
-    };
-
-    records.push(assistantRecord);
-    messages.push(assistantRecord);
-
-    // Add tool results as user messages
-    if (turn.toolCalls.length > 0) {
-      const toolResultUuid = generateUuids
-        ? crypto.randomUUID()
-        : `tool-result-${turn.turnNumber}`;
-
-      const toolResultContent: ClaudeToolResultBlock[] = turn.toolCalls.map(
-        (call) => ({
-          type: "tool_result" as const,
-          tool_use_id: `toolu_${call.callId.replace("call_", "")}`,
-          content: call.output,
-        })
-      );
-
-      const toolResultRecord: ClaudeUserRecord = {
-        type: "user",
-        sessionId,
-        timestamp: new Date().toISOString(),
-        uuid: toolResultUuid,
-        parentUuid: reconstructThreading ? assistantUuid : null,
-        isSidechain: false,
-        userType: "internal",
-        cwd: turn.context?.cwd || codexSession.metadata.cwd,
-        version,
-        gitBranch: codexSession.metadata.git?.branch || "",
-        message: {
-          role: "user",
-          content: toolResultContent,
-        },
-      };
-
-      records.push(toolResultRecord);
-      messages.push(toolResultRecord);
-
-      parentUuid = toolResultUuid;
-    } else {
-      parentUuid = assistantUuid;
     }
   }
-
-  // Create output directory
-  const encodedProjectPath = projectPath.replace(/\//g, "-").replace(/^-/, "");
-  const projectDir = join(finalOutputDir, encodedProjectPath);
-  await mkdir(projectDir, { recursive: true });
-
-  const outputPath = join(projectDir, `${sessionId}.jsonl`);
-
-  // Write JSONL file
-  const content = records.map((r) => JSON.stringify(r)).join("\n") + "\n";
-  await Bun.write(outputPath, content);
-
-  // Build result session
-  const claudeSession: ClaudeSession = {
-    sessionId,
-    projectPath,
-    filePath: outputPath,
-    records,
-    messages,
-    summary: undefined,
-    fileSnapshots: [],
-    metadata: {
-      version,
-      cwd: codexSession.metadata.cwd,
-      gitBranch: codexSession.metadata.git?.branch || "",
-      totalTokens: {
-        input: 0,
-        output: 0,
-      },
-    },
-  };
 
   return {
     success: errors.length === 0,
@@ -1315,8 +2378,8 @@ export async function convertCodexToClaude(
     warnings,
     errors,
     statistics: {
-      recordsConverted: records.length,
-      messagesConverted: codexSession.turns.length * 2,
+      recordsConverted: claudeSession.records.length,
+      messagesConverted: claudeSession.messages.length,
       toolCallsConverted: codexSession.turns.reduce(
         (acc, t) => acc + t.toolCalls.length,
         0
@@ -1372,11 +2435,17 @@ export function validateCodexSession(session: CodexSession): string[] {
     issues.push("No conversation turns found");
   }
 
-  for (const turn of session.turns) {
-    if (!turn.userMessage) {
+  for (const [index, turn] of session.turns.entries()) {
+    if (!turn.userMessage && turn.userImages.length === 0) {
       issues.push(`Turn ${turn.turnNumber} missing user message`);
     }
-    if (!turn.assistantMessage && turn.toolCalls.length === 0) {
+    const isTrailingUserTurn = index === session.turns.length - 1;
+    if (
+      !isTrailingUserTurn &&
+      !turn.assistantMessage &&
+      turn.toolCalls.length === 0 &&
+      turn.agentMessages.length === 0
+    ) {
       issues.push(`Turn ${turn.turnNumber} missing assistant response`);
     }
   }
@@ -1415,23 +2484,61 @@ export async function convertCodexFileToClaude(
  */
 export async function detectSessionFormat(
   filePath: string
-): Promise<"claude" | "codex" | "unknown"> {
+): Promise<"claude" | "codex" | "gemini" | "unknown"> {
   try {
     const file = Bun.file(filePath);
     const text = await file.text();
-    const firstLine = text.split("\n")[0];
-    if (!firstLine) return "unknown";
+    const trimmed = text.trim();
+    if (!trimmed) return "unknown";
 
-    const record = JSON.parse(firstLine);
-
-    // Codex files start with session_meta
-    if (record.type === "session_meta" && record.payload?.originator) {
-      return "codex";
+    // Gemini chats are single JSON documents rather than JSONL.
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        "sessionId" in parsed &&
+        "projectHash" in parsed &&
+        "messages" in parsed &&
+        Array.isArray((parsed as { messages: unknown[] }).messages)
+      ) {
+        return "gemini";
+      }
+    } catch {
+      // Fall through to JSONL detection.
     }
 
-    // Claude files have sessionId and uuid
-    if (record.sessionId && record.uuid) {
-      return "claude";
+    for (const line of trimmed.split("\n").filter(Boolean).slice(0, 100)) {
+      let record: Record<string, unknown>;
+      try {
+        record = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+
+      if (record.type === "session_meta" && record.payload) {
+        return "codex";
+      }
+
+      if (
+        typeof record.sessionId === "string" &&
+        (typeof record.uuid === "string" ||
+          [
+            "attachment",
+            "last-prompt",
+            "atis-latch",
+            "mode",
+            "ai-title",
+            "pr-link",
+            "system",
+            "permission-mode",
+            "file-history-snapshot",
+            "bridge-session",
+            "cost-state",
+          ].includes(String(record.type)))
+      ) {
+        return "claude";
+      }
     }
 
     return "unknown";

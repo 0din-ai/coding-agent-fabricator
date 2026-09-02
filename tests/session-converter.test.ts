@@ -1,6 +1,7 @@
 import { test, expect, beforeAll, afterAll, describe } from "bun:test";
 import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { slugifyClaudeProjectPath } from "../src/session-routing";
 import {
   parseClaudeSession,
   parseCodexSession,
@@ -225,6 +226,38 @@ describe("Session Converter", () => {
     });
   });
 
+  describe("Claude Session Listing", () => {
+    test("uses the stored cwd instead of decoding the project directory slug", async () => {
+      const originalHome = process.env.HOME;
+      const testHome = join(TEST_DIR, "listing-home");
+      const storedCwd = "/workspace/my_project/release.v1";
+      const projectDir = join(
+        testHome,
+        ".claude",
+        "projects",
+        slugifyClaudeProjectPath(storedCwd)
+      );
+      const sessionId = "stored-cwd-session";
+      const content = createClaudeJsonl(sessionId).replaceAll(
+        "/test/project",
+        storedCwd
+      );
+
+      await mkdir(projectDir, { recursive: true });
+      await Bun.write(join(projectDir, `${sessionId}.jsonl`), content);
+      process.env.HOME = testHome;
+
+      try {
+        const sessions = await listClaudeSessions("my_project/release.v1");
+        expect(sessions).toHaveLength(1);
+        expect(sessions[0]?.project).toBe(storedCwd);
+      } finally {
+        if (originalHome === undefined) delete process.env.HOME;
+        else process.env.HOME = originalHome;
+      }
+    });
+  });
+
   describe("Codex Parser", () => {
     test("parseCodexSession parses valid JSONL", async () => {
       const sessionId = "codex-test-session";
@@ -320,7 +353,11 @@ describe("Session Converter", () => {
 
       expect(result.success).toBe(true);
       expect(result.warnings.length).toBeGreaterThan(0);
-      expect(result.warnings[0]).toContain("Thinking content stored as summary");
+      expect(
+        result.warnings.some((warning) =>
+          warning.includes("Thinking content stored as summary")
+        )
+      ).toBe(true);
     });
   });
 
@@ -515,9 +552,10 @@ describe("Session Converter", () => {
       // Check that user message content is preserved
       const userMsg = finalSession.messages[0];
       expect(userMsg?.type).toBe("user");
-      const userContent = (userMsg as ClaudeUserRecord).message.content.find(
-        (c) => c.type === "text"
-      );
+      const content = (userMsg as ClaudeUserRecord).message.content;
+      const userContent = Array.isArray(content)
+        ? content.find((block) => block.type === "text")
+        : undefined;
       expect(userContent?.text).toContain("Hello, can you help me?");
     });
   });
